@@ -1,5 +1,7 @@
 # UniPaste: 跨平台剪贴板同步工具
 
+[简体中文](/README.md)|[English](/README_EN.md)
+
 ![UniPaste](https://img.shields.io/badge/UniPaste-3.0.0-blue)
 ![Python](https://img.shields.io/badge/Python-3.9+-green)
 ![License](https://img.shields.io/badge/License-GPL%20v3-orange)
