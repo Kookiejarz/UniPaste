@@ -1,10 +1,13 @@
 # UniPaste: Secure Cross-Platform Clipboard Sync Tool
+[简体中文](/README.md)|[English](/README_EN.md)
 
 ![UniPaste-favicon](https://github.com/Kookiejarz/UniPaste/blob/main/unipaste.png?raw=true)
 ![UniPaste](https://img.shields.io/badge/UniPaste-1.1.1-blue)
 ![Python](https://img.shields.io/badge/Python-3.9+-green)
 ![License](https://img.shields.io/badge/License-GNU%20GPL-blue) 
 ![Platform](https://img.shields.io/badge/Platform-Mac%20%7C%20Windows-lightgrey)
+
+
 
 UniPaste is an end-to-end encrypted cross-platform clipboard synchronization tool that enables secure sharing of clipboard content between Mac and Windows devices. No cloud services required, protecting your data privacy.
 
