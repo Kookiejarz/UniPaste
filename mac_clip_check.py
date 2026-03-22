@@ -1073,7 +1073,6 @@ class ClipboardListener:
 
 
 async def run_listener(listener: ClipboardListener):
-    AppKit.NSApplication.sharedApplication()
     listener.event_loop = asyncio.get_running_loop()
     loop = asyncio.get_running_loop()
     stop_event = asyncio.Event()
@@ -1125,7 +1124,6 @@ def run_headless():
 
 
 def run_control_panel():
-    AppKit.NSApplication.sharedApplication()
     listener = ClipboardListener()
     autostart_manager = MacLaunchAgentManager(script_path=Path(__file__).resolve())
     host = ServiceHost(
