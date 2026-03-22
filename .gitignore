@@ -20,3 +20,6 @@ __pycache__/
 # App specific files
 .dstore/
 ~/.clipshare/
+
+# Development tools
+generate_icons.py

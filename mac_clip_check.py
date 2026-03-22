@@ -1145,8 +1145,10 @@ def run_headless():
 
 class MacTrayApp(rumps.App):
     def __init__(self, host, open_panel_callback):
-        # Prefer the image if it exists, otherwise just text
-        icon_path = "unipaste.png"
+        # Use the template icon for macOS status bar
+        icon_path = os.path.join("assets", "unipaste_mac_template.png")
+        if not os.path.exists(icon_path):
+             icon_path = os.path.join("assets", "unipaste.png")
         if not os.path.exists(icon_path):
              icon_path = None
         super(MacTrayApp, self).__init__("UniPaste", icon=icon_path, quit_button=None)

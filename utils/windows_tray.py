@@ -46,10 +46,31 @@ class WindowsTrayApp:
     def _has_pending_pairings(self, *_args):
         return bool(self.controller.get_ui_snapshot().get("pending_pairings"))
 
+    def _is_dark_theme(self):
+        try:
+            import winreg
+            key_path = r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path) as key:
+                value, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")
+                return value == 0  # 0 means dark mode, 1 means light mode
+        except Exception:
+            return False
+
     def _load_icon(self):
-        icon_path = Path(__file__).resolve().parents[1] / "unipaste.png"
-        if icon_path.exists():
-            return Image.open(icon_path)
+        root_dir = Path(__file__).resolve().parents[1]
+        assets_dir = root_dir / "assets"
+        is_dark = self._is_dark_theme()
+        
+        ico_name = "unipaste_dark.ico" if is_dark else "unipaste.ico"
+        ico_path = assets_dir / ico_name
+        png_path = assets_dir / "unipaste.png"
+
+        if ico_path.exists():
+            return Image.open(ico_path)
+        if (assets_dir / "unipaste.ico").exists():
+            return Image.open(assets_dir / "unipaste.ico")
+        if png_path.exists():
+            return Image.open(png_path)
 
         image = Image.new("RGBA", (64, 64), "#0f766e")
         draw = ImageDraw.Draw(image)

@@ -68,7 +68,7 @@ jobs:
               ['mac_clip_check.py'],
               pathex=[],
               binaries=[],
-              datas=[('LICENSE', '.'), ('utils', 'utils'), ('handlers', 'handlers'), ('config.py', '.'), ('unipaste.png', '.')],
+              datas=[('LICENSE', '.'), ('utils', 'utils'), ('handlers', 'handlers'), ('config.py', '.'), ('assets', 'assets')],
               hiddenimports=[
                   'AppKit',
                   'tkinter',
@@ -132,12 +132,14 @@ jobs:
         if: matrix.platform == 'windows'
         shell: pwsh
         run: >
-          pyinstaller --onefile --windowed --name "${{ matrix.executable_name }}" --icon "assets/icon.ico"
+          pyinstaller --onefile --windowed --name "${{ matrix.executable_name }}"
+          --icon "assets/unipaste.ico"
           "${{ matrix.entry_script }}"
           --add-data "utils;utils"
           --add-data "handlers;handlers"
           --add-data "config.py;."
-          --add-data "unipaste.png;."
+          --add-data "assets;assets"
+
           --hidden-import="pywin32"
           --hidden-import="win32clipboard"
           --hidden-import="win32con"

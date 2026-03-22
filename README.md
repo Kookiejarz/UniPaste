@@ -2,7 +2,7 @@
 
 [简体中文](/README.md)|[English](/README_EN.md)
 
-![UniPaste-favicon](https://github.com/Kookiejarz/UniPaste/blob/main/unipaste.png?raw=true)
+![UniPaste-favicon](/assets/unipaste.png)
 ![UniPaste](https://img.shields.io/badge/UniPaste-3.0.0-blue)
 ![Python](https://img.shields.io/badge/Python-3.9+-green)
 ![License](https://img.shields.io/badge/License-GPL%20v3-orange)
