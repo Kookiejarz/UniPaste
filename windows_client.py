@@ -58,6 +58,7 @@ class WindowsClipboardClient:
         self.websocket_peer_ids = {}
         self.connection_security = {}
         self.discovered_peers = {}
+        self.service_name_to_id = {}
         self.peer_platforms = {}
         self.peer_retry_state = {}
         self.loop_guard = ClipboardLoopGuard()
@@ -234,6 +235,7 @@ class WindowsClipboardClient:
         properties = service_info.get("properties", {})
         peer_id = properties.get("device_id")
         platform = properties.get("platform", "unknown")
+        service_name = service_info.get("name")
 
         if not url or not peer_id or peer_id == self.device_id:
             return
@@ -242,10 +244,23 @@ class WindowsClipboardClient:
             "url": url,
             "platform": platform,
         }
+        if service_name:
+            self.service_name_to_id[service_name] = peer_id
+            
         self.peer_platforms[peer_id] = platform
         if self._should_initiate_connection(peer_id):
             self.ws_url = url
         print(f"✅ 发现设备 {peer_id} ({platform}): {url}")
+
+    def on_service_lost(self, service_name):
+        """服务丢失回调"""
+        peer_id = self.service_name_to_id.pop(service_name, None)
+        if peer_id:
+            if peer_id in self.discovered_peers:
+                del self.discovered_peers[peer_id]
+                print(f"➖ 设备离线: {peer_id}")
+            # If we were connecting to this peer, we might want to clear ws_url 
+            # but usually it's handled by connection error.
 
     def stop(self):
         """停止节点运行"""
@@ -561,7 +576,7 @@ class WindowsClipboardClient:
     async def sync_clipboard(self):
         """主同步循环，处理连接和重连"""
         print("🔍 搜索剪贴板服务...")
-        self.discovery.start_discovery(self.on_service_found)
+        self.discovery.start_discovery(self.on_service_found, self.on_service_lost)
 
         while self.running:
             try:

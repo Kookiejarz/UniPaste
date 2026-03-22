@@ -40,6 +40,7 @@ class ClipboardListener:
         self.pairing_mgr = PairingManager(timeout_seconds=ClipboardConfig.PAIRING_TIMEOUT_SECONDS)
         self.pairing_mgr.set_pairing_callback(self._on_pairing_request)
         self.discovered_peers = {}
+        self.service_name_to_id = {}
         self.peer_connections = {}
         self.websocket_peer_ids = {}
         self.connection_security = {}
@@ -200,6 +201,8 @@ class ClipboardListener:
         properties = service_info.get("properties", {})
         peer_id = properties.get("device_id")
         platform = properties.get("platform", "unknown")
+        service_name = service_info.get("name")
+
         if not url or not peer_id or peer_id == self.device_id:
             return
 
@@ -207,7 +210,18 @@ class ClipboardListener:
             "url": url,
             "platform": platform,
         }
+        if service_name:
+            self.service_name_to_id[service_name] = peer_id
+            
         print(f"✅ 发现设备 {peer_id} ({platform}): {url}")
+
+    def on_service_lost(self, service_name):
+        """服务丢失回调"""
+        peer_id = self.service_name_to_id.pop(service_name, None)
+        if peer_id:
+            if peer_id in self.discovered_peers:
+                del self.discovered_peers[peer_id]
+                print(f"➖ 设备离线: {peer_id}")
 
     def _register_peer(self, peer_id, websocket):
         existing = self.peer_connections.get(peer_id)
@@ -726,7 +740,7 @@ class ClipboardListener:
 
     async def sync_clipboard(self):
         print("🔍 搜索剪贴板服务...")
-        self.discovery.start_discovery(self.on_service_found)
+        self.discovery.start_discovery(self.on_service_found, self.on_service_lost)
 
         while self.running:
             try:

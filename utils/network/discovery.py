@@ -5,8 +5,9 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 
 class ClipboardServiceListener(ServiceListener):
-    def __init__(self, callback):
-        self.callback = callback
+    def __init__(self, add_callback, remove_callback=None):
+        self.add_callback = add_callback
+        self.remove_callback = remove_callback
         
     def add_service(self, zc, type_, name):
         info = zc.get_service_info(type_, name)
@@ -22,7 +23,7 @@ class ClipboardServiceListener(ServiceListener):
                     else:
                         properties[decoded_key] = str(value)
 
-            self.callback({
+            self.add_callback({
                 "url": f"ws://{address}:{port}",
                 "address": address,
                 "port": port,
@@ -30,9 +31,9 @@ class ClipboardServiceListener(ServiceListener):
                 "properties": properties,
             })
             
-    # Required methods for ServiceListener
     def remove_service(self, zeroconf, type_, name):
-        pass
+        if self.remove_callback:
+            self.remove_callback(name)
 
     def update_service(self, zeroconf, type_, name):
         pass
@@ -70,7 +71,7 @@ class DeviceDiscovery:
         await loop.run_in_executor(self._executor, self.zeroconf.register_service, info)
         print("✅ 服务注册成功")
 
-    def start_discovery(self, callback):
+    def start_discovery(self, add_callback, remove_callback=None):
         """Discover clipboard services on the network."""
         # Stop any existing browser first
         self.stop_browser()
@@ -78,7 +79,7 @@ class DeviceDiscovery:
         self.browser = ServiceBrowser(
             self.zeroconf, 
             self.service_name,
-            ClipboardServiceListener(callback)
+            ClipboardServiceListener(add_callback, remove_callback)
         )
         print("🔍 开始搜索剪贴板服务...")
 
