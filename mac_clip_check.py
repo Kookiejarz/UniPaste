@@ -6,6 +6,8 @@ import signal
 import time
 import os
 import hmac
+import sys
+import argparse
 
 from utils.security.crypto import SecurityManager
 from utils.security.auth import DeviceAuthManager
@@ -19,6 +21,9 @@ from config import ClipboardConfig
 from utils.security.pairing import PairingManager, PairingStatus
 import threading
 from utils.clipboard_utils import ClipboardUtils
+from utils.service_host import ServiceHost
+from utils.control_panel import ControlPanel
+from utils.autostart import MacLaunchAgentManager
 
 class ClipboardListener:
     """剪贴板监听和同步节点"""
@@ -40,6 +45,9 @@ class ClipboardListener:
         self.connection_security = {}
         self.peer_retry_state = {}
         self.loop_guard = ClipboardLoopGuard()
+        self.ui_attention_callback = None
+        self.event_loop = None
+        self.last_ui_error = None
 
     def _init_basic_components(self):
         """初始化基础组件"""
@@ -272,7 +280,6 @@ class ClipboardListener:
         return any(marker in message for marker in expected_markers)
 
     def _on_pairing_request(self, request):
-        """Handle pairing request - show notification to user"""
         print(f"\n{'='*60}")
         print(f"🔗 新设备请求配对:")
         print(f"   设备名称: {request.device_name}")
@@ -280,20 +287,90 @@ class ClipboardListener:
         print(f"   IP地址: {request.ip_address}")
         print(f"   设备ID: {request.device_id}")
         print(f"{'='*60}")
-        print(f"是否允许此设备连接? (输入 'y' 接受, 'n' 拒绝)")
-        
-        # Start input thread to not block async operations
-        def get_user_input():
-            try:
-                choice = input().strip().lower()
-                if choice in ['y', 'yes', 'accept', '是', '接受']:
-                    self.pairing_mgr.accept_pairing(request.device_id)
-                else:
+        print("请在控制面板中确认是否允许此设备连接")
+
+        if callable(self.ui_attention_callback):
+            self.ui_attention_callback()
+            return
+
+        if sys.stdin and sys.stdin.isatty():
+            print("是否允许此设备连接? (输入 'y' 接受, 'n' 拒绝)")
+
+            def get_user_input():
+                try:
+                    choice = input().strip().lower()
+                    if choice in ['y', 'yes', 'accept', '是', '接受']:
+                        self.pairing_mgr.accept_pairing(request.device_id)
+                    else:
+                        self.pairing_mgr.reject_pairing(request.device_id)
+                except Exception:
                     self.pairing_mgr.reject_pairing(request.device_id)
-            except:
-                self.pairing_mgr.reject_pairing(request.device_id)
-                
-        threading.Thread(target=get_user_input, daemon=True).start()
+
+            threading.Thread(target=get_user_input, daemon=True).start()
+
+    def report_ui_error(self, message: str):
+        self.last_ui_error = message
+
+    def accept_pairing_request(self, device_id: str) -> bool:
+        return self.pairing_mgr.accept_pairing(device_id)
+
+    def reject_pairing_request(self, device_id: str) -> bool:
+        return self.pairing_mgr.reject_pairing(device_id)
+
+    def _status_text(self) -> str:
+        if not self.running:
+            return "已停止"
+        if self.peer_connections:
+            return f"已连接 {len(self.peer_connections)} 台设备"
+        if self.discovered_peers:
+            return "已发现设备，等待连接"
+        return "正在后台监听"
+
+    def get_ui_snapshot(self):
+        now = time.time()
+        connected_peers = []
+        for peer_id in sorted(self.peer_connections):
+            peer_info = self.discovered_peers.get(peer_id, {})
+            connected_peers.append({
+                "peer_id": peer_id,
+                "platform": peer_info.get("platform", "unknown"),
+                "url": peer_info.get("url"),
+            })
+
+        discovered_peers = []
+        for peer_id, peer_info in sorted(self.discovered_peers.items()):
+            retry_state = self.peer_retry_state.get(peer_id)
+            retry_in = 0.0
+            if retry_state and retry_state["next_retry_at"] > now:
+                retry_in = retry_state["next_retry_at"] - now
+            discovered_peers.append({
+                "peer_id": peer_id,
+                "platform": peer_info.get("platform", "unknown"),
+                "url": peer_info.get("url"),
+                "connected": peer_id in self.peer_connections,
+                "retry_in": retry_in if retry_in > 0 else None,
+            })
+
+        pending_pairings = [
+            {
+                "device_id": request.device_id,
+                "device_name": request.device_name,
+                "platform": request.platform,
+                "ip_address": request.ip_address,
+            }
+            for request in self.pairing_mgr.list_pending_requests()
+        ]
+
+        return {
+            "platform": self.platform_name,
+            "device_name": self.device_name,
+            "device_id": self.device_id,
+            "status_text": self._status_text(),
+            "connected_peers": connected_peers,
+            "discovered_peers": discovered_peers,
+            "pending_pairings": pending_pairings,
+            "last_error": self.last_ui_error,
+        }
 
     async def handle_client(self, websocket):
         """处理入站 WebSocket 连接"""
@@ -466,9 +543,7 @@ class ClipboardListener:
                 if text:
                     await self.file_handler.process_clipboard_content(
                         text,
-                        time.time(),
                         None,
-                        0,
                         send_direct,
                         origin_device_id=self.device_id,
                         event_id=ClipMessage.new_event_id()
@@ -978,10 +1053,16 @@ class ClipboardListener:
         self.running = False
 
         if hasattr(self, '_stop_server_func'):
-            self._stop_server_func()
+            if self.event_loop and self.event_loop.is_running():
+                self.event_loop.call_soon_threadsafe(self._stop_server_func)
+            else:
+                self._stop_server_func()
 
         if hasattr(self, 'clipboard_task') and self.clipboard_task and not self.clipboard_task.done():
-             self.clipboard_task.cancel()
+             if self.event_loop and self.event_loop.is_running():
+                 self.event_loop.call_soon_threadsafe(self.clipboard_task.cancel)
+             else:
+                 self.clipboard_task.cancel()
 
         self.discovery.close()
 
@@ -991,11 +1072,9 @@ class ClipboardListener:
         print("👋 感谢使用 UniPaste 节点!")
 
 
-async def main():
+async def run_listener(listener: ClipboardListener):
     AppKit.NSApplication.sharedApplication()
-
-    listener = ClipboardListener()
-
+    listener.event_loop = asyncio.get_running_loop()
     loop = asyncio.get_running_loop()
     stop_event = asyncio.Event()
 
@@ -1036,8 +1115,65 @@ async def main():
         print("🚪 程序退出")
 
 
-if __name__ == '__main__':
+async def main():
+    listener = ClipboardListener()
+    await run_listener(listener)
+
+
+def run_headless():
+    asyncio.run(main())
+
+
+def run_control_panel():
+    AppKit.NSApplication.sharedApplication()
+    listener = ClipboardListener()
+    autostart_manager = MacLaunchAgentManager(script_path=Path(__file__).resolve())
+    host = ServiceHost(
+        listener,
+        lambda service: asyncio.run(run_listener(service)),
+        autostart_manager=autostart_manager,
+    )
+    panel = ControlPanel(host, title="UniPaste 控制面板")
+    listener.ui_attention_callback = panel.focus
+    host.start()
     try:
-        asyncio.run(main())
+        panel.run()
+    finally:
+        host.stop()
+        host.join(5)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="UniPaste macOS node")
+    parser.add_argument("--headless", action="store_true", help="仅在后台运行同步服务")
+    parser.add_argument("--install-launch-agent", action="store_true", help="安装开机自启动 LaunchAgent")
+    parser.add_argument("--remove-launch-agent", action="store_true", help="移除开机自启动 LaunchAgent")
+    parser.add_argument("--launch-agent-status", action="store_true", help="查看 LaunchAgent 状态")
+    return parser.parse_args()
+
+
+if __name__ == '__main__':
+    args = parse_args()
+    launch_agent_manager = MacLaunchAgentManager(script_path=Path(__file__).resolve())
+
+    if args.install_launch_agent:
+        ok, message = launch_agent_manager.install()
+        print(message)
+        raise SystemExit(0 if ok else 1)
+
+    if args.remove_launch_agent:
+        ok, message = launch_agent_manager.uninstall()
+        print(message)
+        raise SystemExit(0 if ok else 1)
+
+    if args.launch_agent_status:
+        print("已启用" if launch_agent_manager.is_enabled() else "未启用")
+        raise SystemExit(0)
+
+    try:
+        if args.headless:
+            run_headless()
+        else:
+            run_control_panel()
     except KeyboardInterrupt:
          print("\n⌨️ 检测到 Ctrl+C，强制退出...")

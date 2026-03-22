@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 import threading
 import traceback
+import argparse
 
 import websockets
 
@@ -62,6 +63,9 @@ class WindowsClipboardClient:
         self.loop_guard = ClipboardLoopGuard()
         self.server_task = None
         self.clipboard_task = None
+        self.event_loop = None
+        self.ui_attention_callback = None
+        self.last_ui_error = None
 
         self.file_handler = FileHandler(ClipboardConfig.get_temp_dir())
         self.file_handler.load_file_cache()
@@ -130,19 +134,85 @@ class WindowsClipboardClient:
         print(f"   IP地址: {request.ip_address}")
         print(f"   设备ID: {request.device_id}")
         print(f"{'='*60}")
-        print("是否允许此设备连接? (输入 'y' 接受, 'n' 拒绝)")
+        print("请在托盘控制面板中确认是否允许此设备连接")
 
-        def get_user_input():
-            try:
-                choice = input().strip().lower()
-                if choice in ['y', 'yes', 'accept', '是', '接受']:
-                    self.pairing_mgr.accept_pairing(request.device_id)
-                else:
+        if callable(self.ui_attention_callback):
+            self.ui_attention_callback()
+            return
+
+        if sys.stdin and sys.stdin.isatty():
+            print("是否允许此设备连接? (输入 'y' 接受, 'n' 拒绝)")
+
+            def get_user_input():
+                try:
+                    choice = input().strip().lower()
+                    if choice in ['y', 'yes', 'accept', '是', '接受']:
+                        self.pairing_mgr.accept_pairing(request.device_id)
+                    else:
+                        self.pairing_mgr.reject_pairing(request.device_id)
+                except Exception:
                     self.pairing_mgr.reject_pairing(request.device_id)
-            except Exception:
-                self.pairing_mgr.reject_pairing(request.device_id)
 
-        threading.Thread(target=get_user_input, daemon=True).start()
+            threading.Thread(target=get_user_input, daemon=True).start()
+
+    def report_ui_error(self, message: str):
+        self.last_ui_error = message
+
+    def accept_pairing_request(self, device_id: str) -> bool:
+        return self.pairing_mgr.accept_pairing(device_id)
+
+    def reject_pairing_request(self, device_id: str) -> bool:
+        return self.pairing_mgr.reject_pairing(device_id)
+
+    def get_ui_snapshot(self):
+        now = time.time()
+        connected_peers = []
+        for peer_id in sorted(self.peer_connections):
+            peer_info = self.discovered_peers.get(peer_id, {})
+            connected_peers.append({
+                "peer_id": peer_id,
+                "platform": peer_info.get("platform", "unknown"),
+                "url": peer_info.get("url"),
+            })
+
+        discovered_peers = []
+        for peer_id, peer_info in sorted(self.discovered_peers.items()):
+            retry_state = self.peer_retry_state.get(peer_id)
+            retry_in = 0.0
+            if retry_state and retry_state["next_retry_at"] > now:
+                retry_in = retry_state["next_retry_at"] - now
+            discovered_peers.append({
+                "peer_id": peer_id,
+                "platform": peer_info.get("platform", "unknown"),
+                "url": peer_info.get("url"),
+                "connected": peer_id in self.peer_connections,
+                "retry_in": retry_in if retry_in > 0 else None,
+            })
+
+        pending_pairings = [
+            {
+                "device_id": request.device_id,
+                "device_name": request.device_name,
+                "platform": request.platform,
+                "ip_address": request.ip_address,
+            }
+            for request in self.pairing_mgr.list_pending_requests()
+        ]
+
+        return {
+            "platform": self.platform_name,
+            "device_name": self.device_name,
+            "device_id": self.device_id,
+            "status_text": {
+                ConnectionStatus.DISCONNECTED: "等待对端连接",
+                ConnectionStatus.CONNECTING: "正在连接",
+                ConnectionStatus.CONNECTED: f"已连接 {len(self.peer_connections)} 台设备",
+            }.get(self.connection_status, "未知状态"),
+            "connected_peers": connected_peers,
+            "discovered_peers": discovered_peers,
+            "pending_pairings": pending_pairings,
+            "last_error": self.last_ui_error,
+        }
 
     def _should_initiate_connection(self, peer_id: str) -> bool:
         return bool(peer_id) and peer_id != self.device_id and self.device_id > peer_id
@@ -189,7 +259,10 @@ class WindowsClipboardClient:
         if hasattr(self, 'file_handler'):
             self.file_handler.save_file_cache()
         if hasattr(self, '_stop_server_func'):
-            self._stop_server_func()
+            if self.event_loop and self.event_loop.is_running():
+                self.event_loop.call_soon_threadsafe(self._stop_server_func)
+            else:
+                self._stop_server_func()
         # Cancel running tasks (handled in main loop)
         print("👋 感谢使用 UniPaste!")
 
@@ -355,9 +428,7 @@ class WindowsClipboardClient:
             if text:
                 await self.file_handler.process_clipboard_content(
                     text,
-                    time.time(),
                     None,
-                    0,
                     send_direct,
                     origin_device_id=self.device_id,
                     event_id=ClipMessage.new_event_id()
@@ -1013,60 +1084,92 @@ class WindowsClipboardClient:
             traceback.print_exc()
 
 
-async def main(): # Make main async
-    client = WindowsClipboardClient()
-    main_task = None
+async def run_client_tasks(client: WindowsClipboardClient, include_status: bool = True):
+    client.event_loop = asyncio.get_running_loop()
     status_task = None
+    task_group = []
 
-    # This inner async function might not be strictly necessary anymore,
-    # but we can keep it for structure or integrate its logic directly.
-    async def run_client():
-        nonlocal status_task # Allow modification
-        # Create status task within the running loop
+    if include_status:
         status_task = asyncio.create_task(client.show_connection_status())
-        try:
-            client.server_task = asyncio.create_task(client.start_server())
-            client.clipboard_task = asyncio.create_task(client.send_clipboard_changes())
-            sync_task = asyncio.create_task(client.sync_clipboard())
-            await asyncio.gather(client.server_task, client.clipboard_task, sync_task)
-        finally:
-            # Ensure status task is cancelled if sync_clipboard finishes/errors
-            if status_task and not status_task.done():
-                status_task.cancel()
+        task_group.append(status_task)
 
     try:
         print("🚀 UniPaste Windows 节点已启动")
         print(f"📂 临时文件目录: {client.file_handler.temp_dir}")
-        print("📋 按 Ctrl+C 退出程序")
-
-        main_task = asyncio.create_task(run_client())
-        await main_task
-
-    except KeyboardInterrupt:
-        print("\n👋 检测到 Ctrl+C，正在关闭...")
-    except asyncio.CancelledError:
-         print("\nℹ️ 主任务被取消") # Expected during shutdown
-    except Exception as e:
-        print(f"\n❌ 发生未处理的错误: {e}")
-        traceback.print_exc()
+        client.server_task = asyncio.create_task(client.start_server())
+        client.clipboard_task = asyncio.create_task(client.send_clipboard_changes())
+        sync_task = asyncio.create_task(client.sync_clipboard())
+        task_group.extend([client.server_task, client.clipboard_task, sync_task])
+        await asyncio.gather(client.server_task, client.clipboard_task, sync_task)
     finally:
-        print("⏳ 正在清理资源...")
         client.stop()
-
-        # Cancel tasks if they are still running (main_task should be done or cancelled)
-        tasks_to_cancel = [t for t in [status_task, main_task] if t and not t.done()]
-        if tasks_to_cancel:
-            for task in tasks_to_cancel:
+        for task in task_group:
+            if task and not task.done():
                 task.cancel()
-            # Wait briefly for tasks to cancel
-            await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
+        if task_group:
+            await asyncio.gather(*task_group, return_exceptions=True)
 
-        print("🚪 程序退出")
+
+async def main():
+    client = WindowsClipboardClient()
+    await run_client_tasks(client)
+
+
+def _run_service_thread(service: WindowsClipboardClient):
+    asyncio.run(run_client_tasks(service, include_status=False))
+
+
+def run_tray_app():
+    from utils.service_host import ServiceHost
+    from utils.control_panel import ControlPanel
+    from utils.windows_tray import WindowsTrayApp
+
+    client = WindowsClipboardClient()
+    host = ServiceHost(client, _run_service_thread)
+
+    panel_state = {"thread": None, "panel": None}
+
+    def open_panel():
+        panel = panel_state.get("panel")
+        if panel and panel.root:
+            panel.focus()
+            return
+
+        def panel_main():
+            panel = ControlPanel(host, title="UniPaste 控制面板")
+            panel_state["panel"] = panel
+            try:
+                panel.run()
+            finally:
+                panel_state["panel"] = None
+
+        panel_thread = threading.Thread(target=panel_main, name="unipaste-control-panel", daemon=True)
+        panel_state["thread"] = panel_thread
+        panel_thread.start()
+
+    tray = WindowsTrayApp(host, open_panel)
+    client.ui_attention_callback = tray.notify_pairing_request
+    host.start()
+    try:
+        tray.run()
+    finally:
+        host.stop()
+        host.join(5)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="UniPaste Windows node")
+    parser.add_argument("--headless", action="store_true", help="仅在控制台前台运行，不启动托盘")
+    return parser.parse_args()
 
 
 if __name__ == "__main__":
+    args = parse_args()
     try:
-        asyncio.run(main())
+        if args.headless:
+            asyncio.run(main())
+        else:
+            run_tray_app()
     except RuntimeError as e:
          if "Event loop is closed" in str(e):
               print("ℹ️ Event loop closed.")

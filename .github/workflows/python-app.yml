@@ -68,9 +68,11 @@ jobs:
               ['mac_clip_check.py'],
               pathex=[],
               binaries=[],
-              datas=[('LICENSE', '.'), ('utils', 'utils'), ('handlers', 'handlers'), ('config.py', '.')],
+              datas=[('LICENSE', '.'), ('utils', 'utils'), ('handlers', 'handlers'), ('config.py', '.'), ('unipaste.png', '.')],
               hiddenimports=[
                   'AppKit',
+                  'tkinter',
+                  'tkinter.ttk',
                   'websockets',
                   'cryptography',
                   'pyperclip',
@@ -81,6 +83,9 @@ jobs:
                   'utils.message_format',
                   'utils.platform_config',
                   'utils.clipboard_utils',
+                  'utils.control_panel',
+                  'utils.service_host',
+                  'utils.autostart',
                   'handlers.file_handler',
                   'config',
               ],
@@ -108,7 +113,7 @@ jobs:
               upx=True,
               upx_exclude=[],
               runtime_tmpdir=None,
-              console=True,
+              console=False,
               disable_windowed_traceback=False,
               argv_emulation=True,
               target_arch=None,
@@ -123,17 +128,23 @@ jobs:
         if: matrix.platform == 'windows'
         shell: pwsh
         run: >
-          pyinstaller --onefile --name "${{ matrix.executable_name }}"
+          pyinstaller --onefile --windowed --name "${{ matrix.executable_name }}"
           "${{ matrix.entry_script }}"
           --add-data "utils;utils"
           --add-data "handlers;handlers"
           --add-data "config.py;."
+          --add-data "unipaste.png;."
           --hidden-import="pywin32"
           --hidden-import="win32clipboard"
           --hidden-import="win32con"
           --hidden-import="win32com.shell"
           --hidden-import="pythoncom"
           --hidden-import="pyperclip"
+          --hidden-import="pystray"
+          --hidden-import="PIL.Image"
+          --hidden-import="PIL.ImageDraw"
+          --hidden-import="tkinter"
+          --hidden-import="tkinter.ttk"
           --hidden-import="websockets"
           --hidden-import="cryptography"
           --hidden-import="zeroconf"
@@ -145,6 +156,9 @@ jobs:
           --hidden-import="utils.message_format"
           --hidden-import="utils.platform_config"
           --hidden-import="utils.clipboard_utils"
+          --hidden-import="utils.control_panel"
+          --hidden-import="utils.service_host"
+          --hidden-import="utils.windows_tray"
           --hidden-import="handlers.file_handler"
           --hidden-import="config"
 

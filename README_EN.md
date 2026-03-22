@@ -20,6 +20,8 @@ UniPaste is an end-to-end encrypted cross-platform clipboard synchronization too
 - **Clipboard Loop Prevention**: Smart detection prevents infinite clipboard content loops between devices
 - **Multi-Peer Support**: Keep multiple devices connected at the same time
 - **Chunked File Transfer**: Large files are streamed in chunks and can resume after reconnect
+- **Background Native Flow**: Windows runs from the system tray and macOS can install a LaunchAgent for login startup
+- **Simple Control Panel**: Review live status, discovered peers, and pending pairing requests
 - **Multiple Content Types**: Support for text and file path transfers
 
 ## 📥 Installation
@@ -54,6 +56,13 @@ python mac_clip_check.py
 python windows_client.py
 ```
 
+Windows stays in the system tray after launch.  
+To enable login startup on macOS:
+
+```sh
+python mac_clip_check.py --install-launch-agent
+```
+
 ## 📋 Practical Usage Flow
 
 1. Start the macOS node and the Windows node in any order
@@ -61,6 +70,12 @@ python windows_client.py
 3. The peers will discover each other and choose a single connection direction from their device IDs
 4. Once connected, clipboard content stays synchronized across all connected devices
 5. File transfers continue in chunks and can resume after reconnect
+
+To run macOS in background-only mode:
+
+```sh
+python mac_clip_check.py --headless
+```
 
 ## 🔒 Encryption Technology Details
 
