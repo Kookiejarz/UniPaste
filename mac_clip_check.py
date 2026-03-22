@@ -863,6 +863,16 @@ class ClipboardListener:
                     self._save_device_token(token)
                     self.device_token = token
                     return response_data.get("peer_id")
+            
+            # If rejected or unauthorized, handle failure
+            reason = response_data.get("reason", "未知原因")
+            print(f"❌ 身份验证失败: {reason}")
+            if status == "unauthorized":
+                print("⚠️ 本地令牌可能已失效，正在清除并准备重新配对...")
+                token_path = self._get_token_path()
+                if token_path.exists():
+                    token_path.unlink()
+                self.device_token = None
             return None
         except Exception as e:
             print(f"❌ 身份验证过程中出错: {e}")

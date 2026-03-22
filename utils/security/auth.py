@@ -44,14 +44,15 @@ class DeviceAuthManager:
     def _get_hardware_key(self):
         """生成基于硬件ID的32字节密钥 (Base64编码)"""
         try:
-            # 组合 MAC 地址和一些系统特征作为种子
+            # 组合 MAC 地址。uuid.getnode() 在某些系统上可能不稳，但它是目前最通用的。
             mac = str(uuid.getnode())
-            seed = f"unipaste-hw-bound-{mac}-{os.getlogin()}"
+            # 加上用户主目录名作为辅助标识，比 os.getlogin() 更稳定
+            user_part = Path.home().name
+            seed = f"unipaste-v1-{mac}-{user_part}"
             key_hash = hashlib.sha256(seed.encode()).digest()
             return base64.urlsafe_b64encode(key_hash)
         except Exception:
-            # Fallback to a fixed but hidden seed if login name fails
-            seed = f"unipaste-hw-fallback-{uuid.getnode()}"
+            seed = f"unipaste-fallback-{uuid.getnode()}"
             key_hash = hashlib.sha256(seed.encode()).digest()
             return base64.urlsafe_b64encode(key_hash)
 
@@ -99,10 +100,12 @@ class DeviceAuthManager:
                         try:
                             return json.loads(data)
                         except:
+                            print("⚠️ 无法解析授权列表数据，可能已损坏")
                             return {}
                 else:
-                    return json.load(f)
-        except (json.JSONDecodeError, FileNotFoundError, Exception):
+                    return json.loads(data)
+        except (json.JSONDecodeError, FileNotFoundError, Exception) as e:
+            print(f"⚠️ 加载授权列表出错: {e}")
             return {}
 
     def _save_devices(self):
