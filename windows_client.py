@@ -57,11 +57,13 @@ class WindowsClipboardClient:
         self.peer_connections = {}
         self.websocket_peer_ids = {}
         self.connection_security = {}
+        self.connection_send_locks = {}
         self.discovered_peers = {}
         self.service_name_to_id = {}
         self.peer_platforms = {}
         self.peer_retry_state = {}
         self.loop_guard = ClipboardLoopGuard()
+        self.background_tasks = set()
         self.server_task = None
         self.clipboard_task = None
         self.sync_task = None
@@ -288,16 +290,15 @@ class WindowsClipboardClient:
         # Close discovery
         if hasattr(self, 'discovery'):
             self.discovery.close()
-        # Save file cache
-        if hasattr(self, 'file_handler'):
-            self.file_handler.save_file_cache()
-            self.file_handler.cleanup()
             
         # Cancel tasks to wake up from sleep
         if self.event_loop and self.event_loop.is_running():
             for task_attr in ['server_task', 'clipboard_task', 'sync_task', 'status_task']:
                 task = getattr(self, task_attr, None)
                 if task and not task.done():
+                    self.event_loop.call_soon_threadsafe(task.cancel)
+            for task in list(self.background_tasks):
+                if not task.done():
                     self.event_loop.call_soon_threadsafe(task.cancel)
             
             if hasattr(self, '_stop_server_func'):
@@ -313,12 +314,21 @@ class WindowsClipboardClient:
         
         print("👋 感谢使用 UniPaste!")
 
+    async def finalize_shutdown(self):
+        if self.background_tasks:
+            await asyncio.gather(*list(self.background_tasks), return_exceptions=True)
+
+        if hasattr(self, 'file_handler'):
+            self.file_handler.save_file_cache()
+            self.file_handler.cleanup()
+
     def _register_peer(self, peer_id, websocket):
         existing = self.peer_connections.get(peer_id)
         if existing and existing != websocket:
             return False
         self.peer_connections[peer_id] = websocket
         self.websocket_peer_ids[websocket] = peer_id
+        self.connection_send_locks.setdefault(websocket, asyncio.Lock())
         self._update_connection_status()
         return True
 
@@ -327,6 +337,7 @@ class WindowsClipboardClient:
         if peer_id and self.peer_connections.get(peer_id) == websocket:
             del self.peer_connections[peer_id]
         self.connection_security.pop(websocket, None)
+        self.connection_send_locks.pop(websocket, None)
         self._update_connection_status()
         return peer_id
 
@@ -337,6 +348,40 @@ class WindowsClipboardClient:
             manager.generate_key_pair()
             self.connection_security[websocket] = manager
         return manager
+
+    def _get_send_lock(self, websocket):
+        return self.connection_send_locks.setdefault(websocket, asyncio.Lock())
+
+    def _track_background_task(self, task: asyncio.Task):
+        self.background_tasks.add(task)
+
+        def _cleanup(done_task: asyncio.Task):
+            self.background_tasks.discard(done_task)
+            if done_task.cancelled():
+                return
+            try:
+                exc = done_task.exception()
+            except Exception as error:
+                print(f"❌ 后台任务状态读取失败: {error}")
+                return
+            if exc:
+                print(f"❌ 后台任务执行失败: {exc}")
+
+        task.add_done_callback(_cleanup)
+        return task
+
+    def _schedule_background_transfer(self, transfer_coro, label: str):
+        async def _runner():
+            try:
+                await transfer_coro
+            except asyncio.CancelledError:
+                print(f"⏹️ 后台文件传输已取消: {label}")
+                raise
+            except Exception as e:
+                print(f"❌ 后台文件传输失败 ({label}): {e}")
+                traceback.print_exc()
+
+        return self._track_background_task(asyncio.create_task(_runner()))
 
     def _build_clipboard_snapshot(self):
         file_paths = ClipboardUtils.get_clipboard_files()
@@ -439,12 +484,7 @@ class WindowsClipboardClient:
             security_mgr = self._get_connection_security(websocket)
             if not security_mgr or not security_mgr.has_shared_key():
                 continue
-            try:
-                encrypted_data = security_mgr.encrypt_message(data_to_encrypt)
-            except Exception as e:
-                print(f"❌ 加密广播数据失败: {e}")
-                continue
-            tasks.append(asyncio.create_task(websocket.send(encrypted_data)))
+            tasks.append(asyncio.create_task(self._send_encrypted(data_to_encrypt, websocket)))
 
         if tasks:
             done, pending = await asyncio.wait(tasks, timeout=10.0)
@@ -466,7 +506,9 @@ class WindowsClipboardClient:
                     None,
                     send_direct,
                     origin_device_id=self.device_id,
-                    event_id=ClipMessage.new_event_id()
+                    event_id=ClipMessage.new_event_id(),
+                    delivery_mode="oneshot",
+                    schedule_transfer=self._schedule_background_transfer
                 )
                 print("📤 已向新连接设备发送当前文件剪贴板快照")
                 return
@@ -776,7 +818,8 @@ class WindowsClipboardClient:
             if not security_mgr or not security_mgr.has_shared_key():
                 raise ValueError("Connection shared key not established")
             encrypted = security_mgr.encrypt_message(data)
-            await websocket.send(encrypted)
+            async with self._get_send_lock(websocket):
+                await websocket.send(encrypted)
         except websockets.exceptions.ConnectionClosed:
              print("❌ 发送数据失败：连接已关闭")
              self.connection_status = ConnectionStatus.DISCONNECTED # Update status
@@ -798,10 +841,6 @@ class WindowsClipboardClient:
             try:
                 if not self.peer_connections:
                     await asyncio.sleep(ClipboardConfig.CLIPBOARD_CHECK_INTERVAL)
-                    continue
-
-                if self.is_receiving:
-                    await asyncio.sleep(0.1)
                     continue
 
                 current_change_count = ClipboardUtils.get_clipboard_change_count()
@@ -826,12 +865,14 @@ class WindowsClipboardClient:
                             self.last_content_hash,
                             send_encrypted_wrapper,
                             origin_device_id=self.device_id,
-                            event_id=ClipMessage.new_event_id()
+                            event_id=ClipMessage.new_event_id(),
+                            delivery_mode="oneshot",
+                            schedule_transfer=self._schedule_background_transfer
                         )
                         if update_sent:
                             self.last_content_hash = new_hash
                             sent_update_this_cycle = True
-                            print("📤 文件信息已发送，等待对端按需请求内容...")
+                            print("📤 文件已进入 oneshot 直传队列")
 
                     if sent_update_this_cycle:
                          await asyncio.sleep(ClipboardConfig.CLIPBOARD_CHECK_INTERVAL)
@@ -917,13 +958,16 @@ class WindowsClipboardClient:
                      request_origin = message.get("origin_device_id")
                      if file_path_requested:
                           print(f"📤 收到文件请求: {Path(file_path_requested).name}")
-                          await self.file_handler.handle_file_transfer(
-                               file_path_requested,
-                               send_encrypted_wrapper,
-                               start_chunk=resume_from_chunk,
-                               transfer_id=transfer_id,
-                               origin_device_id=request_origin,
-                               event_id=event_id
+                          self._schedule_background_transfer(
+                               self.file_handler.handle_file_transfer(
+                                   file_path_requested,
+                                   send_encrypted_wrapper,
+                                   start_chunk=resume_from_chunk,
+                                   transfer_id=transfer_id,
+                                   origin_device_id=request_origin,
+                                   event_id=event_id
+                               ),
+                               Path(file_path_requested).name
                           )
                      else:
                           print("⚠️ 收到的文件请求缺少路径")
@@ -1157,6 +1201,7 @@ async def run_client_tasks(client: WindowsClipboardClient, include_status: bool 
                 task.cancel()
         if task_group:
             await asyncio.gather(*task_group, return_exceptions=True)
+        await client.finalize_shutdown()
 
 
 async def main():

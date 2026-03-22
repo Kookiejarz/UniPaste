@@ -55,8 +55,10 @@ class ClipboardListener:
         self.peer_connections = {}
         self.websocket_peer_ids = {}
         self.connection_security = {}
+        self.connection_send_locks = {}
         self.peer_retry_state = {}
         self.loop_guard = ClipboardLoopGuard()
+        self.background_tasks = set()
         self.status_task = None
         self.event_loop = None
         self.last_ui_error = None
@@ -261,6 +263,7 @@ class ClipboardListener:
         self.peer_connections[peer_id] = websocket
         self.websocket_peer_ids[websocket] = peer_id
         self.connected_clients.add(websocket)
+        self.connection_send_locks.setdefault(websocket, asyncio.Lock())
         return True
 
     def _unregister_peer(self, websocket):
@@ -269,6 +272,7 @@ class ClipboardListener:
             del self.peer_connections[peer_id]
         self.connected_clients.discard(websocket)
         self.connection_security.pop(websocket, None)
+        self.connection_send_locks.pop(websocket, None)
         return peer_id
 
     def _get_connection_security(self, websocket, create=False):
@@ -278,6 +282,41 @@ class ClipboardListener:
             manager.generate_key_pair()
             self.connection_security[websocket] = manager
         return manager
+
+    def _get_send_lock(self, websocket):
+        return self.connection_send_locks.setdefault(websocket, asyncio.Lock())
+
+    def _track_background_task(self, task: asyncio.Task):
+        self.background_tasks.add(task)
+
+        def _cleanup(done_task: asyncio.Task):
+            self.background_tasks.discard(done_task)
+            if done_task.cancelled():
+                return
+            try:
+                exc = done_task.exception()
+            except Exception as error:
+                print(f"❌ 后台任务状态读取失败: {error}")
+                return
+            if exc:
+                print(f"❌ 后台任务执行失败: {exc}")
+
+        task.add_done_callback(_cleanup)
+        return task
+
+    def _schedule_background_transfer(self, transfer_coro, label: str):
+        async def _runner():
+            try:
+                await transfer_coro
+            except asyncio.CancelledError:
+                print(f"⏹️ 后台文件传输已取消: {label}")
+                raise
+            except Exception as e:
+                print(f"❌ 后台文件传输失败 ({label}): {e}")
+                import traceback
+                traceback.print_exc()
+
+        return self._track_background_task(asyncio.create_task(_runner()))
 
     def _get_peer_retry_state(self, peer_id):
         return self.peer_retry_state.setdefault(
@@ -578,7 +617,9 @@ class ClipboardListener:
                         None,
                         send_direct,
                         origin_device_id=self.device_id,
-                        event_id=ClipMessage.new_event_id()
+                        event_id=ClipMessage.new_event_id(),
+                        delivery_mode="oneshot",
+                        schedule_transfer=self._schedule_background_transfer
                     )
                     print("📤 已向新连接设备发送当前文件剪贴板快照")
                     return
@@ -606,7 +647,8 @@ class ClipboardListener:
             if not security_mgr or not security_mgr.has_shared_key():
                 raise ValueError("Connection shared key not established")
             encrypted = security_mgr.encrypt_message(data)
-            await websocket.send(encrypted)
+            async with self._get_send_lock(websocket):
+                await websocket.send(encrypted)
         except Exception as e:
             print(f"❌ 发送加密数据失败: {e}")
             if websocket in self.connected_clients:
@@ -705,13 +747,16 @@ class ClipboardListener:
                       print(f"📤 收到文件请求: {Path(normalized_path).name}")
                       print(f"🔍 原始路径: {file_path_requested}")
                       print(f"🔍 标准化路径: {normalized_path}")
-                      await self.file_handler.handle_file_transfer(
-                           normalized_path,
-                           lambda data: self._send_encrypted(data, sender_websocket),
-                           start_chunk=resume_from_chunk,
-                           transfer_id=transfer_id,
-                           origin_device_id=request_origin,
-                           event_id=event_id
+                      self._schedule_background_transfer(
+                           self.file_handler.handle_file_transfer(
+                               normalized_path,
+                               lambda data: self._send_encrypted(data, sender_websocket),
+                               start_chunk=resume_from_chunk,
+                               transfer_id=transfer_id,
+                               origin_device_id=request_origin,
+                               event_id=event_id
+                           ),
+                           Path(normalized_path).name
                       )
                  else:
                       print("⚠️ 收到的文件请求缺少路径")
@@ -751,8 +796,7 @@ class ClipboardListener:
                 security_mgr = self._get_connection_security(websocket)
                 if not security_mgr or not security_mgr.has_shared_key():
                     continue
-                encrypted_data = security_mgr.encrypt_message(data_to_encrypt)
-                tasks.append(asyncio.create_task(websocket.send(encrypted_data)))
+                tasks.append(asyncio.create_task(self._send_encrypted(data_to_encrypt, websocket)))
             except Exception as e:
                 print(f"❌ 创建广播任务失败: {e}")
                 if websocket in self.connected_clients:
@@ -954,10 +998,6 @@ class ClipboardListener:
             try:
                 current_time = time.time()
 
-                if self.is_receiving:
-                    await asyncio.sleep(0.1)
-                    continue
-
                 time_since_process = current_time - last_processed_time
                 if time_since_process < ClipboardConfig.MIN_PROCESS_INTERVAL:
                     await asyncio.sleep(0.1)
@@ -1018,12 +1058,14 @@ class ClipboardListener:
                         self.last_content_hash,
                         self.broadcast_encrypted_data,
                         origin_device_id=self.device_id,
-                        event_id=ClipMessage.new_event_id()
+                        event_id=ClipMessage.new_event_id(),
+                        delivery_mode="oneshot",
+                        schedule_transfer=self._schedule_background_transfer
                     )
                     if update_sent:
                         self.last_content_hash = new_hash
                         sent_update = True
-                        print("📤 文件信息已发送，等待对端请求文件内容...")
+                        print("📤 文件已进入 oneshot 直传队列")
                     return sent_update
 
             if AppKit.NSPasteboardTypeString in types:
@@ -1107,6 +1149,9 @@ class ClipboardListener:
                 task = getattr(self, task_attr, None)
                 if task and not task.done():
                     self.event_loop.call_soon_threadsafe(task.cancel)
+            for task in list(self.background_tasks):
+                if not task.done():
+                    self.event_loop.call_soon_threadsafe(task.cancel)
 
             if hasattr(self, '_stop_server_func'):
                 self.event_loop.call_soon_threadsafe(self._stop_server_func)
@@ -1116,11 +1161,15 @@ class ClipboardListener:
 
         self.discovery.close()
 
+        print("👋 感谢使用 UniPaste 节点!")
+
+    async def finalize_shutdown(self):
+        if self.background_tasks:
+            await asyncio.gather(*list(self.background_tasks), return_exceptions=True)
+
         if hasattr(self, 'file_handler'):
              self.file_handler.save_file_cache()
              self.file_handler.cleanup()
-
-        print("👋 感谢使用 UniPaste 节点!")
 
 
 async def run_listener(listener: ClipboardListener):
@@ -1163,7 +1212,7 @@ async def run_listener(listener: ClipboardListener):
     finally:
         if listener.running:
              listener.stop()
-        await asyncio.sleep(0.5)
+        await listener.finalize_shutdown()
         print("🚪 程序退出")
 
 

@@ -515,6 +515,7 @@ class FileHandler:
     def cleanup(self):
         """清理临时目录下的所有文件"""
         print(f"🧹 正在清理临时文件目录: {self.temp_dir}")
+        had_failures = False
         try:
             for item in self.temp_dir.iterdir():
                 try:
@@ -524,11 +525,19 @@ class FileHandler:
                         import shutil
                         shutil.rmtree(item)
                 except Exception as e:
+                    had_failures = True
                     print(f"⚠️ 无法删除 {item.name}: {e}")
+            if had_failures:
+                print("⚠️ 临时文件清理未完全完成，将保留缓存索引以便下次继续处理")
+                return False
+
             self.file_cache = {}
+            self.shared_item_metadata = {}
             print("✅ 临时文件清理完成")
+            return True
         except Exception as e:
             print(f"❌ 清理临时目录失败: {e}")
+            return False
 
     def add_to_file_cache(self, file_hash, file_path):
         """添加文件到缓存"""
@@ -719,6 +728,7 @@ class FileHandler:
         Checks the cache and requests missing files from the sender.
         """
         files = file_info_message.get("files", [])
+        delivery_mode = file_info_message.get("delivery_mode") or "request"
         if not files:
             print("❌ 收到空的文件列表")
             return False
@@ -802,6 +812,11 @@ class FileHandler:
                     else:
                         await self.set_clipboard_file(Path(cached_files[0]))
                     print(f"📎 已将 {len(cached_files)} 个缓存文件设置到剪贴板")
+            return True
+
+        if delivery_mode == "oneshot":
+            print(f"📥 收到文件信息: {', '.join(file_names[:3])}{' 等' if len(file_names) > 3 else ''}")
+            print("🚀 对端使用 oneshot 文件直传，等待后续文件流...")
             return True
 
         print(f"📥 收到文件信息: {', '.join(file_names[:3])}{' 等' if len(file_names) > 3 else ''}")
@@ -932,7 +947,9 @@ class FileHandler:
         last_content_hash,
         send_encrypted_fn,
         origin_device_id=None,
-        event_id=None
+        event_id=None,
+        delivery_mode: str = "request",
+        schedule_transfer=None
     ):
         """处理剪贴板中的文件, 发送文件信息"""
         content_hash = self.get_files_content_hash(file_urls)
@@ -954,12 +971,27 @@ class FileHandler:
         file_msg = ClipMessage.file_message(
             prepared_entries,
             origin_device_id=origin_device_id,
-            event_id=event_id
+            event_id=event_id,
+            delivery_mode=delivery_mode
         )
         message_json = ClipMessage.serialize(file_msg)
 
         await send_encrypted_fn(message_json.encode("utf-8"))
         print("🔐 已发送加密的文件信息")
+
+        if delivery_mode == "oneshot":
+            print("🚀 已启用 oneshot 文件直传，不再等待对端请求")
+            for entry in prepared_entries:
+                transfer_coro = self.handle_file_transfer(
+                    entry["path"],
+                    send_encrypted_fn,
+                    origin_device_id=origin_device_id,
+                    event_id=event_id
+                )
+                if schedule_transfer:
+                    schedule_transfer(transfer_coro, Path(entry["path"]).name)
+                else:
+                    await transfer_coro
 
         return content_hash, True
 

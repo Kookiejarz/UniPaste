@@ -38,7 +38,7 @@ class ClipMessage:
         return uuid.uuid4().hex
     
     @staticmethod
-    def file_message(file_paths, origin_device_id=None, event_id=None):
+    def file_message(file_paths, origin_device_id=None, event_id=None, delivery_mode=None):
         """创建文件路径消息
         
         file_paths 可以是单个路径或路径列表
@@ -85,10 +85,17 @@ class ClipMessage:
                 file_info.update(extra_fields)
                 file_infos.append(file_info)
         
-        return ClipMessage.add_event_metadata({
+        message = {
             "type": MessageType.FILE,
             "files": file_infos
-        }, origin_device_id=origin_device_id, event_id=event_id)
+        }
+        if delivery_mode:
+            message["delivery_mode"] = delivery_mode
+        return ClipMessage.add_event_metadata(
+            message,
+            origin_device_id=origin_device_id,
+            event_id=event_id
+        )
     
     @staticmethod
     def file_request_message(
