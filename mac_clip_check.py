@@ -10,6 +10,8 @@ import sys
 import argparse
 import rumps
 import threading
+import multiprocessing
+from multiprocessing import Process, Manager, Queue
 
 from utils.security.crypto import SecurityManager
 from utils.security.auth import DeviceAuthManager
@@ -1122,7 +1124,8 @@ async def run_listener(listener: ClipboardListener):
         await asyncio.gather(listener.server_task, listener.sync_task, listener.clipboard_task)
 
     except asyncio.CancelledError:
-        print("\n⏹️ 主任务已取消")
+        # Expected on shutdown
+        pass
     except Exception as e:
         print(f"\n❌ 发生未处理的错误: {e}")
         import traceback
@@ -1177,44 +1180,122 @@ class MacTrayApp(rumps.App):
         )
 
 
-def run_control_panel():
-    listener = ClipboardListener()
-    autostart_manager = MacLaunchAgentManager(script_path=Path(__file__).resolve())
-    host = ServiceHost(
-        listener,
-        lambda service: asyncio.run(run_listener(service)),
-        autostart_manager=autostart_manager,
-    )
+class SharedHostProxy:
+    """A proxy that looks like ServiceHost but works across processes."""
+    def __init__(self, shared_dict, cmd_queue):
+        self.shared_dict = shared_dict
+        self.cmd_queue = cmd_queue
 
-    panel_state = {"thread": None, "panel": None}
+    def get_ui_snapshot(self):
+        return dict(self.shared_dict)
 
-    def open_panel():
-        panel = panel_state.get("panel")
-        if panel and panel.root:
-            panel.focus()
-            return
+    def accept_pairing_request(self, device_id):
+        self.cmd_queue.put(("accept", device_id))
+        return True
 
-        def panel_main():
-            panel = ControlPanel(host, title="UniPaste 控制面板")
-            panel_state["panel"] = panel
-            try:
-                panel.run()
-            finally:
-                panel_state["panel"] = None
+    def reject_pairing_request(self, device_id):
+        self.cmd_queue.put(("reject", device_id))
+        return True
 
-        panel_thread = threading.Thread(target=panel_main, name="unipaste-control-panel", daemon=True)
-        panel_state["thread"] = panel_thread
-        panel_thread.start()
+    def install_autostart(self):
+        self.cmd_queue.put(("install_autostart", None))
+        return True, "请求已发送"
 
-    tray = MacTrayApp(host, open_panel)
-    listener.ui_attention_callback = tray.notify_pairing_request
-    
-    host.start()
+    def remove_autostart(self):
+        self.cmd_queue.put(("remove_autostart", None))
+        return True, "请求已发送"
+
+    def stop(self):
+        pass # Panel process shouldn't stop the service
+
+
+def run_panel_process(shared_dict, cmd_queue):
+    """Entry point for the separate UI process."""
     try:
-        tray.run()
-    finally:
-        host.stop()
-        host.join(5)
+        from utils.control_panel import ControlPanel
+        proxy = SharedHostProxy(shared_dict, cmd_queue)
+        panel = ControlPanel(proxy, title="UniPaste 控制面板")
+        panel.run()
+    except Exception as e:
+        print(f"❌ 控制面板进程崩溃: {e}")
+
+
+def run_control_panel():
+    # Use Multiprocessing for Mac UI to avoid thread conflicts
+    # We must use 'spawn' to be safe on Mac with UI frameworks
+    try:
+        multiprocessing.set_start_method('spawn', force=True)
+    except RuntimeError:
+        pass
+    
+    with Manager() as manager:
+        shared_dict = manager.dict()
+        cmd_queue = Queue()
+        
+        listener = ClipboardListener()
+        autostart_manager = MacLaunchAgentManager(script_path=Path(__file__).resolve())
+        host = ServiceHost(
+            listener,
+            lambda service: asyncio.run(run_listener(service)),
+            autostart_manager=autostart_manager,
+        )
+
+        panel_process_info = {"process": None}
+
+        def open_panel():
+            p = panel_process_info["process"]
+            if p and p.is_alive():
+                return
+
+            p = Process(target=run_panel_process, args=(shared_dict, cmd_queue), daemon=True)
+            p.start()
+            panel_process_info["process"] = p
+
+        # Background thread to sync state and process commands
+        def sync_worker():
+            while listener.running:
+                try:
+                    # Update snapshot
+                    snapshot = host.get_ui_snapshot()
+                    shared_dict.update(snapshot)
+                    
+                    # Process commands from panel
+                    while not cmd_queue.empty():
+                        try:
+                            cmd_info = cmd_queue.get_nowait()
+                            cmd, arg = cmd_info
+                            if cmd == "accept":
+                                host.accept_pairing_request(arg)
+                            elif cmd == "reject":
+                                host.reject_pairing_request(arg)
+                            elif cmd == "install_autostart":
+                                host.install_autostart()
+                            elif cmd == "remove_autostart":
+                                host.remove_autostart()
+                        except Exception as qe:
+                             print(f"⚠️ 处理指令失败: {qe}")
+                    
+                    time.sleep(0.5)
+                except Exception as e:
+                    if listener.running:
+                        print(f"⚠️ 状态同步出错: {e}")
+                    time.sleep(1)
+
+        sync_thread = threading.Thread(target=sync_worker, daemon=True)
+        sync_thread.start()
+
+        tray = MacTrayApp(host, open_panel)
+        listener.ui_attention_callback = tray.notify_pairing_request
+        
+        host.start()
+        try:
+            tray.run()
+        finally:
+            host.stop()
+            p = panel_process_info["process"]
+            if p and p.is_alive():
+                p.terminate()
+            host.join(5)
 
 
 def parse_args():

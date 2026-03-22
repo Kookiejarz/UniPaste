@@ -1131,6 +1131,9 @@ async def run_client_tasks(client: WindowsClipboardClient, include_status: bool 
         client.sync_task = asyncio.create_task(client.sync_clipboard())
         task_group.extend([client.server_task, client.clipboard_task, client.sync_task])
         await asyncio.gather(client.server_task, client.clipboard_task, client.sync_task)
+    except asyncio.CancelledError:
+        # Expected on shutdown
+        pass
     finally:
         client.stop()
         for task in task_group:
