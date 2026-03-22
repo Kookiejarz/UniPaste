@@ -118,6 +118,7 @@ class FileHandler:
         total_chunks: int,
         chunk_size: int,
         file_hash: str | None,
+        content_fingerprint: str | None = None,
         origin_device_id: str | None = None,
         event_id: str | None = None
     ) -> dict:
@@ -140,6 +141,7 @@ class FileHandler:
             "chunk_size": chunk_size,
             "total_chunks": total_chunks,
             "file_hash": file_hash,
+            "content_fingerprint": content_fingerprint,
             "origin_device_id": origin_device_id,
             "event_id": event_id,
             "part_path": part_path,
@@ -211,6 +213,7 @@ class FileHandler:
         chunk_size = int(message.get("chunk_size") or self.chunk_size)
         total_chunks = int(message.get("total_chunks") or 0)
         file_hash = message.get("file_hash")
+        content_fingerprint = message.get("content_fingerprint")
         origin_device_id = message.get("origin_device_id")
         event_id = message.get("event_id")
         transfer_id = message.get("transfer_id") or self.build_transfer_id(
@@ -231,6 +234,7 @@ class FileHandler:
             total_chunks,
             chunk_size,
             file_hash,
+            content_fingerprint=content_fingerprint,
             origin_device_id=origin_device_id,
             event_id=event_id
         )
@@ -285,6 +289,7 @@ class FileHandler:
             file_hash = ClipMessage.calculate_file_hash(str(path_obj))
             transfer_id = transfer_id or self.build_transfer_id(path_obj.name, file_size, file_hash)
             item_metadata = self.shared_item_metadata.get(str(path_obj), {})
+            content_fingerprint = item_metadata.get("content_fingerprint")
             start_chunk = max(0, min(int(start_chunk or 0), total_chunks))
             start_offset = start_chunk * self.chunk_size
 
@@ -297,6 +302,7 @@ class FileHandler:
                 "chunk_size": self.chunk_size,
                 "total_chunks": total_chunks,
                 "file_hash": file_hash,
+                "content_fingerprint": content_fingerprint,
                 "transfer_id": transfer_id,
                 "start_chunk": start_chunk,
                 "origin_device_id": origin_device_id,
@@ -330,6 +336,7 @@ class FileHandler:
                         "chunk_size": self.chunk_size,
                         "size": file_size,
                         "file_hash": file_hash,
+                        "content_fingerprint": content_fingerprint,
                         "chunk_hash": hashlib.md5(chunk_data).hexdigest(),
                         "chunk_data": base64.b64encode(chunk_data).decode("utf-8"),
                         "origin_device_id": origin_device_id,
@@ -374,6 +381,7 @@ class FileHandler:
             chunk_size = int(message.get("chunk_size") or self.chunk_size)
             file_size = int(message.get("size") or 0)
             file_hash = message.get("file_hash")
+            content_fingerprint = message.get("content_fingerprint")
             origin_device_id = message.get("origin_device_id")
             event_id = message.get("event_id")
             transfer_id = message.get("transfer_id") or self.build_transfer_id(
@@ -392,6 +400,7 @@ class FileHandler:
                     total_chunks,
                     chunk_size,
                     file_hash,
+                    content_fingerprint=content_fingerprint,
                     origin_device_id=origin_device_id,
                     event_id=event_id
                 )
@@ -465,6 +474,7 @@ class FileHandler:
                             transfer["total_chunks"],
                             transfer["chunk_size"],
                             transfer["file_hash"],
+                            content_fingerprint=transfer.get("content_fingerprint"),
                             origin_device_id=transfer.get("origin_device_id"),
                             event_id=transfer.get("event_id")
                         ),
@@ -477,6 +487,9 @@ class FileHandler:
             os.replace(part_path, final_path)
             final_hash = expected_hash or actual_hash
             self.add_to_file_cache(final_hash, str(final_path))
+            content_fingerprint = transfer.get("content_fingerprint")
+            if content_fingerprint and content_fingerprint != final_hash:
+                self.add_to_file_cache(content_fingerprint, str(final_path))
             self._discard_transfer_state(transfer_id, remove_partial=False)
             print(f"✅ 文件 {filename} 哈希校验成功")
             return True, final_path
@@ -637,11 +650,13 @@ class FileHandler:
                 continue
 
             if path_obj.is_dir():
+                content_fingerprint = self.get_files_content_hash([str(path_obj)])
                 archive_path = self._archive_directory(path_obj)
                 metadata = {
                     "item_type": "directory",
                     "clipboard_name": path_obj.name,
                     "archive_format": "zip",
+                    "content_fingerprint": content_fingerprint,
                 }
                 self.shared_item_metadata[str(archive_path)] = metadata
                 prepared_entries.append({
@@ -652,9 +667,11 @@ class FileHandler:
                 continue
 
             if path_obj.is_file():
+                content_fingerprint = ClipMessage.calculate_file_hash(str(path_obj))
                 metadata = {
                     "item_type": "file",
                     "clipboard_name": path_obj.name,
+                    "content_fingerprint": content_fingerprint,
                 }
                 self.shared_item_metadata[str(path_obj)] = metadata
                 prepared_entries.append({
@@ -710,6 +727,9 @@ class FileHandler:
             file_hash = message.get("file_hash")
             if file_hash:
                 self.add_to_file_cache(file_hash, str(final_dir))
+            content_fingerprint = message.get("content_fingerprint")
+            if content_fingerprint and content_fingerprint != file_hash:
+                self.add_to_file_cache(content_fingerprint, str(final_dir))
 
             try:
                 completed_path.unlink(missing_ok=True)
@@ -722,16 +742,32 @@ class FileHandler:
             shutil.rmtree(staging_dir, ignore_errors=True)
             raise
 
-    async def handle_received_files(self, file_info_message, send_encrypted_func, sender_websocket=None):
+    async def handle_received_files(
+        self,
+        file_info_message,
+        send_encrypted_func,
+        sender_websocket=None,
+        current_content_hash: str | None = None
+    ):
         """
         Handles a received FILE message containing file metadata.
         Checks the cache and requests missing files from the sender.
         """
         files = file_info_message.get("files", [])
         delivery_mode = file_info_message.get("delivery_mode") or "request"
+        clipboard_fingerprint = file_info_message.get("clipboard_fingerprint")
         if not files:
             print("❌ 收到空的文件列表")
             return False
+
+        if (
+            delivery_mode != "oneshot"
+            and clipboard_fingerprint
+            and current_content_hash
+            and clipboard_fingerprint == current_content_hash
+        ):
+            print("⏭️ 跳过重复文件快照 (与当前剪贴板内容一致)")
+            return True
 
         files_to_request = []
         file_names = []
@@ -739,6 +775,7 @@ class FileHandler:
 
         for file_info in files:
             file_hash = file_info.get("hash")
+            content_fingerprint = file_info.get("content_fingerprint")
             filename = file_info.get("filename")
             file_path = file_info.get("path")
             file_size = int(file_info.get("size") or 0)
@@ -758,8 +795,11 @@ class FileHandler:
             file_names.append(filename)
 
             cached_file_path = self.get_from_file_cache(file_hash) if file_hash else None
+            if not cached_file_path and content_fingerprint:
+                cached_file_path = self.get_from_file_cache(content_fingerprint)
             if cached_file_path:
-                print(f"✅ 文件 '{filename}' 在缓存中找到 (Hash: {file_hash[:8]}...)")
+                cache_key = content_fingerprint or file_hash or ""
+                print(f"✅ 文件 '{filename}' 在缓存中找到 (Hash: {cache_key[:8]}...)")
                 cached_files.append(cached_file_path)
                 continue
 
@@ -972,7 +1012,8 @@ class FileHandler:
             prepared_entries,
             origin_device_id=origin_device_id,
             event_id=event_id,
-            delivery_mode=delivery_mode
+            delivery_mode=delivery_mode,
+            clipboard_fingerprint=content_hash
         )
         message_json = ClipMessage.serialize(file_msg)
 

@@ -38,7 +38,13 @@ class ClipMessage:
         return uuid.uuid4().hex
     
     @staticmethod
-    def file_message(file_paths, origin_device_id=None, event_id=None, delivery_mode=None):
+    def file_message(
+        file_paths,
+        origin_device_id=None,
+        event_id=None,
+        delivery_mode=None,
+        clipboard_fingerprint=None
+    ):
         """创建文件路径消息
         
         file_paths 可以是单个路径或路径列表
@@ -91,6 +97,8 @@ class ClipMessage:
         }
         if delivery_mode:
             message["delivery_mode"] = delivery_mode
+        if clipboard_fingerprint:
+            message["clipboard_fingerprint"] = clipboard_fingerprint
         return ClipMessage.add_event_metadata(
             message,
             origin_device_id=origin_device_id,

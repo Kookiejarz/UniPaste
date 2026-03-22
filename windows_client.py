@@ -507,8 +507,7 @@ class WindowsClipboardClient:
                     send_direct,
                     origin_device_id=self.device_id,
                     event_id=ClipMessage.new_event_id(),
-                    delivery_mode="oneshot",
-                    schedule_transfer=self._schedule_background_transfer
+                    delivery_mode="request"
                 )
                 print("📤 已向新连接设备发送当前文件剪贴板快照")
                 return
@@ -940,7 +939,10 @@ class WindowsClipboardClient:
                 elif msg_type == MessageType.FILE:
                     # Handle file info - request missing files via wrapper
                     await self.file_handler.handle_received_files(
-                         message, send_encrypted_wrapper, sender_websocket=websocket
+                         message,
+                         send_encrypted_wrapper,
+                         sender_websocket=websocket,
+                         current_content_hash=self.last_content_hash
                     )
                 elif msg_type == MessageType.FILE_START:
                     await self.file_handler.handle_transfer_start(message)

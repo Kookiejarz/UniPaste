@@ -618,8 +618,7 @@ class ClipboardListener:
                         send_direct,
                         origin_device_id=self.device_id,
                         event_id=ClipMessage.new_event_id(),
-                        delivery_mode="oneshot",
-                        schedule_transfer=self._schedule_background_transfer
+                        delivery_mode="request"
                     )
                     print("📤 已向新连接设备发送当前文件剪贴板快照")
                     return
@@ -714,7 +713,8 @@ class ClipboardListener:
                 await self.file_handler.handle_received_files(
                     message,
                     lambda data: self._send_encrypted(data, sender_websocket),
-                    sender_websocket=sender_websocket
+                    sender_websocket=sender_websocket,
+                    current_content_hash=self.last_content_hash
                 )
 
             elif msg_type == MessageType.FILE_START:
