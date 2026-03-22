@@ -1,5 +1,4 @@
 """剪贴板通用工具函数"""
-import hashlib
 import time
 from pathlib import Path
 
@@ -25,26 +24,6 @@ elif IS_MACOS:
 
 class ClipboardUtils:
     """剪贴板工具类，提供跨平台的剪贴板操作"""
-    
-    @staticmethod
-    def calculate_content_hash(content: str) -> str:
-        """计算内容的哈希值"""
-        return hashlib.md5(content.encode()).hexdigest()
-    
-    @staticmethod
-    def should_ignore_content(content_hash: str, last_remote_hash: str, 
-                            last_remote_time: float, delay_multiplier: float = 2) -> bool:
-        """检查是否应该忽略内容（防止回环）"""
-        current_time = time.time()
-        return (last_remote_hash == content_hash and 
-                current_time - last_remote_time < ClipboardConfig.UPDATE_DELAY * delay_multiplier)
-    
-    @staticmethod
-    def format_display_content(content: str, max_length: int = None) -> str:
-        """格式化显示内容"""
-        if max_length is None:
-            max_length = ClipboardConfig.MAX_DISPLAY_LENGTH
-        return content[:max_length] + ("..." if len(content) > max_length else "")
 
     # Windows specific methods
     if IS_WINDOWS:

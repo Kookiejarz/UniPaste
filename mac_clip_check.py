@@ -32,9 +32,6 @@ class ClipboardListener:
         self.device_id = self._get_device_id()
         self.device_name = ClipboardConfig.get_device_name(self.platform_name)
         self.device_token = self._load_device_token()
-        self.last_remote_content_hash = None
-        self.last_remote_update_time = 0
-        self.ignore_clipboard_until = 0 # Timestamp until which local clipboard changes are ignored
         self.pairing_mgr = PairingManager(timeout_seconds=ClipboardConfig.PAIRING_TIMEOUT_SECONDS)
         self.pairing_mgr.set_pairing_callback(self._on_pairing_request)
         self.discovered_peers = {}
@@ -59,9 +56,8 @@ class ClipboardListener:
     def _init_state_flags(self):
         """初始化状态标志"""
         self.last_change_count = self.pasteboard.changeCount()
-        self.last_content_hash = None # Hash of the last content *sent* or *set* by this instance
+        self.last_content_hash = None
         self.is_receiving = False # Flag to prevent processing while receiving
-        self.last_update_time = 0 # Timestamp of the last clipboard update *initiated by this instance*
         self.running = True
         self.server = None
 
@@ -94,12 +90,8 @@ class ClipboardListener:
         if not event:
             return False
 
-        now = time.time()
         self.last_change_count = change_count
         self.last_content_hash = snapshot["fingerprint"]
-        self.last_update_time = now
-        self.last_remote_content_hash = snapshot["fingerprint"]
-        self.last_remote_update_time = now
         print(f"⏭️ 已消费远端{event.kind}剪贴板回显，不再回传")
         return True
 
@@ -126,12 +118,8 @@ class ClipboardListener:
             print(f"❌ 将文件 {completed_path.name} 设置到剪贴板失败")
             return
 
-        now = time.time()
         self.last_change_count = change_count
         self.last_content_hash = content_hash
-        self.last_update_time = now
-        self.last_remote_content_hash = content_hash
-        self.last_remote_update_time = now
         self._register_applied_remote_event(message, "files", content_hash, change_count)
 
         print("✅ 文件已设置到剪贴板并可用于粘贴")
@@ -549,13 +537,9 @@ class ClipboardListener:
                 success = self.pasteboard.setString_forType_(text, AppKit.NSPasteboardTypeString)
 
                 if success:
-                    now = time.time()
                     change_count = self.pasteboard.changeCount()
                     self.last_change_count = change_count
                     self.last_content_hash = content_hash
-                    self.last_update_time = now
-                    self.last_remote_content_hash = content_hash
-                    self.last_remote_update_time = now
                     self._register_applied_remote_event(message, "text", content_hash, change_count)
 
                     display_text = text[:ClipboardConfig.MAX_DISPLAY_LENGTH] + ("..." if len(text) > ClipboardConfig.MAX_DISPLAY_LENGTH else "")
@@ -849,10 +833,6 @@ class ClipboardListener:
                     await asyncio.sleep(0.1)
                     continue
 
-                if current_time < self.ignore_clipboard_until:
-                    await asyncio.sleep(0.1)
-                    continue
-
                 time_since_process = current_time - last_processed_time
                 if time_since_process < ClipboardConfig.MIN_PROCESS_INTERVAL:
                     await asyncio.sleep(0.1)
@@ -917,7 +897,6 @@ class ClipboardListener:
                     )
                     if update_sent:
                         self.last_content_hash = new_hash
-                        self.last_update_time = time.time()
                         sent_update = True
                         print("📤 文件信息已发送，等待对端请求文件内容...")
                     return sent_update
@@ -925,24 +904,15 @@ class ClipboardListener:
             if AppKit.NSPasteboardTypeString in types:
                 text = self.pasteboard.stringForType_(AppKit.NSPasteboardTypeString)
                 if text and self.connected_clients:
-                    content_hash = hashlib.md5(text.encode()).hexdigest()
-                    if (self.last_remote_content_hash == content_hash and
-                        time.time() - self.last_remote_update_time < ClipboardConfig.UPDATE_DELAY * 2):
-                        return False
-
-                    current_time = time.time()
-                    new_hash, new_time, update_sent = await self.file_handler.process_clipboard_content(
+                    new_hash, update_sent = await self.file_handler.process_clipboard_content(
                         text,
-                        current_time,
                         self.last_content_hash,
-                        self.last_update_time,
                         self.broadcast_encrypted_data,
                         origin_device_id=self.device_id,
                         event_id=ClipMessage.new_event_id()
                     )
                     if update_sent:
                         self.last_content_hash = new_hash
-                        self.last_update_time = new_time
                         sent_update = True
                     return sent_update
 

@@ -49,17 +49,9 @@ class WindowsClipboardClient:
         self.pairing_mgr.set_pairing_callback(self._on_pairing_request)
         self.running = True
         self.connection_status = ConnectionStatus.DISCONNECTED
-        self.reconnect_delay = 3
-        self.max_reconnect_delay = 30
-        self.last_discovery_time = 0
-        self.last_content_hash = None # Hash of last content *sent* or *set* by this client
-        self.last_update_time = 0 # Timestamp of last update *initiated* by this client
+        self.last_change_count = ClipboardUtils.get_clipboard_change_count()
+        self.last_content_hash = None
         self.last_format_log = set()
-        # self.last_file_content_hash = None # Combined into last_content_hash
-        self.last_remote_content_hash = None # Hash of last content *received* from remote
-        self.last_remote_update_time = 0 # Timestamp of last *received* remote update
-        self.ignore_clipboard_until = 0 # Timestamp until which local clipboard changes are ignored
-        self._last_processed_content = None # Store last successfully processed text content
         self.server = None
         self.peer_connections = {}
         self.websocket_peer_ids = {}
@@ -165,7 +157,6 @@ class WindowsClipboardClient:
 
     def on_service_found(self, service_info):
         """服务发现回调"""
-        self.last_discovery_time = time.time()
         if isinstance(service_info, str):
             service_info = {"url": service_info, "properties": {}}
 
@@ -245,7 +236,7 @@ class WindowsClipboardClient:
             }
         return None
 
-    def _consume_expected_clipboard_echo(self) -> bool:
+    def _consume_expected_clipboard_echo(self, change_count: int | None) -> bool:
         snapshot = self._build_clipboard_snapshot()
         if not snapshot:
             return False
@@ -253,18 +244,13 @@ class WindowsClipboardClient:
         event = self.loop_guard.consume_if_expected(
             kind=snapshot["kind"],
             fingerprint=snapshot["fingerprint"],
-            change_count=ClipboardUtils.get_clipboard_change_count(),
+            change_count=change_count,
         )
         if not event:
             return False
 
-        now = time.time()
+        self.last_change_count = change_count
         self.last_content_hash = snapshot["fingerprint"]
-        self.last_update_time = now
-        self.last_remote_content_hash = snapshot["fingerprint"]
-        self.last_remote_update_time = now
-        if snapshot["kind"] == "text":
-            self._last_processed_content = snapshot["text"]
         print(f"⏭️ 已消费远端{event.kind}剪贴板回显，不再回传")
         return True
 
@@ -689,42 +675,31 @@ class WindowsClipboardClient:
 
     async def send_clipboard_changes(self):
         """监控并发送剪贴板变化"""
-        last_send_attempt_time = 0
-
         async def send_encrypted_wrapper(data_to_encrypt: bytes):
             await self.broadcast_encrypted_data(data_to_encrypt)
 
         while self.running:
             try:
-                current_time = time.time()
-
                 if not self.peer_connections:
                     await asyncio.sleep(ClipboardConfig.CLIPBOARD_CHECK_INTERVAL)
                     continue
 
-                if self._consume_expected_clipboard_echo():
-                    await asyncio.sleep(ClipboardConfig.CLIPBOARD_CHECK_INTERVAL)
-                    continue
-
-                # Ignore if we are currently processing a received update
                 if self.is_receiving:
                     await asyncio.sleep(0.1)
                     continue
 
-                # Ignore if we recently updated the clipboard locally
-                if current_time < self.ignore_clipboard_until:
-                    await asyncio.sleep(0.1)
+                current_change_count = ClipboardUtils.get_clipboard_change_count()
+                if current_change_count is None or current_change_count == self.last_change_count:
+                    await asyncio.sleep(ClipboardConfig.CLIPBOARD_CHECK_INTERVAL)
                     continue
 
-                # Limit check frequency
-                if current_time - last_send_attempt_time < ClipboardConfig.CLIPBOARD_CHECK_INTERVAL:
-                    await asyncio.sleep(0.1)
+                if self._consume_expected_clipboard_echo(current_change_count):
+                    await asyncio.sleep(ClipboardConfig.CLIPBOARD_CHECK_INTERVAL)
                     continue
 
-                last_send_attempt_time = current_time
+                self.last_change_count = current_change_count
                 sent_update_this_cycle = False
 
-                # --- Check for Files ---
                 file_paths = ClipboardUtils.get_clipboard_files()
                 if file_paths:
                     content_hash = self.file_handler.get_files_content_hash(file_paths)
@@ -738,48 +713,30 @@ class WindowsClipboardClient:
                             event_id=ClipMessage.new_event_id()
                         )
                         if update_sent:
-                            self.last_content_hash = new_hash # Update hash after sending info
-                            self.last_update_time = time.time()
+                            self.last_content_hash = new_hash
                             sent_update_this_cycle = True
                             print("📤 文件信息已发送，等待对端按需请求内容...")
 
-                    # If files handled, skip text check for this cycle
                     if sent_update_this_cycle:
-                         await asyncio.sleep(ClipboardConfig.CLIPBOARD_CHECK_INTERVAL) # Wait before next check
+                         await asyncio.sleep(ClipboardConfig.CLIPBOARD_CHECK_INTERVAL)
                          continue
 
-
-                # --- Check for Text (if no files were sent) ---
                 current_content = ClipboardUtils.get_clipboard_text()
-
-                # Process only if text content exists and is different from last processed
-                if current_content and current_content != self._last_processed_content:
-                    # Anti-loop check: Compare with last received remote hash
+                if current_content:
                     content_hash = hashlib.md5(current_content.encode()).hexdigest()
-                    if (self.last_remote_content_hash == content_hash and
-                        current_time - self.last_remote_update_time < ClipboardConfig.UPDATE_DELAY * 2):
-                        # print("⏭️ 跳过发送回环文本内容") # Less verbose
-                        pass # Don't send back recently received content
-                    # Check if different from last *sent* content or enough time passed
-                    elif content_hash != self.last_content_hash or current_time - self.last_update_time > ClipboardConfig.UPDATE_DELAY:
+                    if content_hash != self.last_content_hash:
                         print(f"📋 检测到剪贴板文本变化 (Hash: {content_hash[:8]}...)")
-                        # Process and send text message
-                        new_hash, new_time, update_sent = await self.file_handler.process_clipboard_content(
+                        new_hash, update_sent = await self.file_handler.process_clipboard_content(
                             current_content,
-                            current_time,
                             self.last_content_hash,
-                            self.last_update_time,
                             send_encrypted_wrapper,
                             origin_device_id=self.device_id,
                             event_id=ClipMessage.new_event_id()
                         )
                         if update_sent:
                             self.last_content_hash = new_hash
-                            self.last_update_time = new_time
-                            self._last_processed_content = current_content # Update last processed text
                             sent_update_this_cycle = True
 
-                # Regular sleep interval if nothing was sent
                 if not sent_update_this_cycle:
                     await asyncio.sleep(ClipboardConfig.CLIPBOARD_CHECK_INTERVAL)
 
@@ -1010,12 +967,8 @@ class WindowsClipboardClient:
                 print("❌ 更新Windows文本剪贴板失败")
                 return
 
+            self.last_change_count = ClipboardUtils.get_clipboard_change_count()
             self.last_content_hash = content_hash
-            self.last_update_time = time.time()
-            self._last_processed_content = text
-
-            self.last_remote_content_hash = content_hash
-            self.last_remote_update_time = time.time()
             self._register_applied_remote_event(message, "text", content_hash)
 
             display_text = text[:ClipboardConfig.MAX_DISPLAY_LENGTH] + ("..." if len(text) > ClipboardConfig.MAX_DISPLAY_LENGTH else "")
@@ -1047,12 +1000,8 @@ class WindowsClipboardClient:
                     return # Don't update clipboard
 
                 if ClipboardUtils.set_clipboard_file(completed_path):
-                     # Update state *after* successful clipboard operation
-                     self.last_content_hash = content_hash # Mark this hash as processed locally
-                     self.last_update_time = time.time() # Mark time of local update
-                     # Record hash and time from remote sender for loop detection
-                     self.last_remote_content_hash = content_hash
-                     self.last_remote_update_time = time.time()
+                     self.last_change_count = ClipboardUtils.get_clipboard_change_count()
+                     self.last_content_hash = content_hash
                      self._register_applied_remote_event(message, "files", content_hash)
                      print("🔄 文件已登记为远端事件回显，下一次变化不会回传")
                 else:

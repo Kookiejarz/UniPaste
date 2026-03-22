@@ -793,23 +793,21 @@ class FileHandler:
     async def process_clipboard_content(
         self,
         text: str,
-        current_time: float,
         last_content_hash: str,
-        last_update_time: float,
         send_encrypted_fn,
         origin_device_id=None,
         event_id=None
-    ) -> tuple[str, float, bool]:
+    ) -> tuple[str, bool]:
         """
         处理剪贴板文本内容, 发送文本消息.
-        Returns: (new_hash, new_update_time, sent_update)
+        Returns: (new_hash, sent_update)
         """
         if not text or text.strip() == "" or self._looks_like_temp_file_path(text):
-            return last_content_hash, last_update_time, False
+            return last_content_hash, False
 
         content_hash = hashlib.md5(text.encode()).hexdigest()
         if content_hash == last_content_hash:
-            return last_content_hash, last_update_time, False
+            return last_content_hash, False
 
         display_content = text[:ClipboardConfig.MAX_DISPLAY_LENGTH] + (
             "..." if len(text) > ClipboardConfig.MAX_DISPLAY_LENGTH else ""
@@ -826,5 +824,4 @@ class FileHandler:
         await send_encrypted_fn(message_json.encode("utf-8"))
         print("🔐 已发送加密的文本")
 
-        new_update_time = time.time()
-        return content_hash, new_update_time, True
+        return content_hash, True
