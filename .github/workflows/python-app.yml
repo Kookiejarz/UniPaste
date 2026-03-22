@@ -139,7 +139,6 @@ jobs:
           --add-data "handlers;handlers"
           --add-data "config.py;."
           --add-data "assets;assets"
-
           --hidden-import="pywin32"
           --hidden-import="win32clipboard"
           --hidden-import="win32con"
