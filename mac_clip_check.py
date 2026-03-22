@@ -50,12 +50,14 @@ class ClipboardListener:
         self.connection_security = {}
         self.peer_retry_state = {}
         self.loop_guard = ClipboardLoopGuard()
-        self.ui_attention_callback = None
+        self.status_task = None
         self.event_loop = None
         self.last_ui_error = None
         self.server_task = None
         self.clipboard_task = None
         self.sync_task = None
+        self.discovery_event = asyncio.Event()
+
 
     def _init_basic_components(self):
         """初始化基础组件"""
@@ -230,6 +232,10 @@ class ClipboardListener:
             self.service_name_to_id[service_name] = peer_id
             
         print(f"✅ 发现设备 {peer_id} ({platform}): {url}")
+        
+        # 触发同步事件，唤醒挂起的重连循环
+        if self.event_loop and self.event_loop.is_running():
+            self.event_loop.call_soon_threadsafe(self.discovery_event.set)
 
     def on_service_lost(self, service_name):
         """服务丢失回调"""
@@ -760,21 +766,20 @@ class ClipboardListener:
 
         while self.running:
             try:
+                # 重置发现事件
+                self.discovery_event.clear()
+
                 now = time.time()
                 connected_peer_ids = set(self.peer_connections.keys())
                 candidate_peer_id = None
                 candidate_url = None
-                next_retry_at = None
+
                 for peer_id, peer_info in sorted(self.discovered_peers.items()):
                     if not self._should_initiate_connection(peer_id):
                         continue
                     if peer_id in connected_peer_ids:
                         continue
-                    retry_state = self.peer_retry_state.get(peer_id)
-                    if retry_state and retry_state["next_retry_at"] > now:
-                        retry_at = retry_state["next_retry_at"]
-                        next_retry_at = retry_at if next_retry_at is None else min(next_retry_at, retry_at)
-                        continue
+
                     candidate_peer_id = peer_id
                     candidate_url = peer_info.get("url")
                     break
@@ -785,21 +790,17 @@ class ClipboardListener:
                         await self.connect_and_sync(candidate_peer_id, candidate_url)
                     except Exception as e:
                         if self._is_expected_peer_unavailable_error(e):
-                            print(f"ℹ️ 设备 {candidate_peer_id} 当前不可用，等待对端连接: {e}")
+                            print(f"ℹ️ 设备 {candidate_peer_id} 当前不可用，等待重连... ({e})")
                         else:
                             print(f"❌ 与设备 {candidate_peer_id} 建立连接失败: {e}")
-                        self._mark_peer_failure(candidate_peer_id, e)
-                        await asyncio.sleep(0.5)
+                        # 失败后，短暂休眠，防止 CPU 尖峰
+                        await asyncio.sleep(2)
                 else:
-                    if next_retry_at is not None:
-                        sleep_for = max(
-                            ClipboardConfig.CLIPBOARD_CHECK_INTERVAL,
-                            min(next_retry_at - now, ClipboardConfig.PEER_RETRY_BASE_DELAY),
-                        )
-                    else:
-                        sleep_for = ClipboardConfig.CLIPBOARD_CHECK_INTERVAL
-                    await asyncio.sleep(sleep_for)
+                    # 【核心】如果没有可连接的设备，彻底挂起，直到 mDNS 发现新设备
+                    await self.discovery_event.wait()
+
             except asyncio.CancelledError:
+
                 break
             except Exception as e:
                 print(f"❌ 主同步循环出错: {e}")
