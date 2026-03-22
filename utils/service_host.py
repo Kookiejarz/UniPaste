@@ -29,6 +29,7 @@ class ServiceHost:
             self.runner(self.service)
         except Exception as exc:
             self._startup_error = exc
+            print(f"❌ 后台服务启动失败: {exc}")
             if hasattr(self.service, "report_ui_error"):
                 self.service.report_ui_error(str(exc))
 
