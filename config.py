@@ -12,7 +12,7 @@ class ClipboardConfig:
     # 时间间隔配置
     MIN_PROCESS_INTERVAL = 0.8  # 最小处理间隔
     NETWORK_DELAY = 0.05  # 网络传输延迟
-    CLIPBOARD_CHECK_INTERVAL = 0.5  # 剪贴板检查间隔
+    CLIPBOARD_CHECK_INTERVAL = 0.3  # 剪贴板检查间隔
     
     # 显示相关
     MAX_DISPLAY_LENGTH = 100  # 最大显示长度

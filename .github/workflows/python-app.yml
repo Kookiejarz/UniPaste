@@ -76,6 +76,9 @@ jobs:
                   'websockets',
                   'cryptography',
                   'pyperclip',
+                  'zeroconf',
+                  'netifaces',
+                  'rumps',
                   'utils.security.crypto',
                   'utils.security.auth',
                   'utils.security.pairing',
@@ -86,6 +89,7 @@ jobs:
                   'utils.control_panel',
                   'utils.service_host',
                   'utils.autostart',
+                  'utils.windows_tray',
                   'handlers.file_handler',
                   'config',
               ],
@@ -128,7 +132,7 @@ jobs:
         if: matrix.platform == 'windows'
         shell: pwsh
         run: >
-          pyinstaller --onefile --windowed --name "${{ matrix.executable_name }}"
+          pyinstaller --onefile --windowed --name "${{ matrix.executable_name }}" --icon "assets/icon.ico"
           "${{ matrix.entry_script }}"
           --add-data "utils;utils"
           --add-data "handlers;handlers"

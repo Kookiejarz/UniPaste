@@ -8,6 +8,8 @@ import os
 import hmac
 import sys
 import argparse
+import rumps
+import threading
 
 from utils.security.crypto import SecurityManager
 from utils.security.auth import DeviceAuthManager
@@ -49,6 +51,9 @@ class ClipboardListener:
         self.ui_attention_callback = None
         self.event_loop = None
         self.last_ui_error = None
+        self.server_task = None
+        self.clipboard_task = None
+        self.sync_task = None
 
     def _init_basic_components(self):
         """初始化基础组件"""
@@ -1066,17 +1071,17 @@ class ClipboardListener:
         print("\n⏹️ 正在请求停止节点...")
         self.running = False
 
-        if hasattr(self, '_stop_server_func'):
-            if self.event_loop and self.event_loop.is_running():
-                self.event_loop.call_soon_threadsafe(self._stop_server_func)
-            else:
-                self._stop_server_func()
+        if self.event_loop and self.event_loop.is_running():
+            for task_attr in ['server_task', 'clipboard_task', 'sync_task']:
+                task = getattr(self, task_attr, None)
+                if task and not task.done():
+                    self.event_loop.call_soon_threadsafe(task.cancel)
 
-        if hasattr(self, 'clipboard_task') and self.clipboard_task and not self.clipboard_task.done():
-             if self.event_loop and self.event_loop.is_running():
-                 self.event_loop.call_soon_threadsafe(self.clipboard_task.cancel)
-             else:
-                 self.clipboard_task.cancel()
+            if hasattr(self, '_stop_server_func'):
+                self.event_loop.call_soon_threadsafe(self._stop_server_func)
+        else:
+            if hasattr(self, '_stop_server_func'):
+                self._stop_server_func()
 
         self.discovery.close()
 
@@ -1110,11 +1115,11 @@ async def run_listener(listener: ClipboardListener):
         print(f"📂 临时文件目录: {listener.temp_dir}")
         print("📋 按 Ctrl+C 退出程序")
 
-        server_task = asyncio.create_task(listener.start_server())
-        sync_task = asyncio.create_task(listener.sync_clipboard())
+        listener.server_task = asyncio.create_task(listener.start_server())
+        listener.sync_task = asyncio.create_task(listener.sync_clipboard())
         listener.clipboard_task = asyncio.create_task(listener.check_clipboard())
 
-        await asyncio.gather(server_task, sync_task, listener.clipboard_task)
+        await asyncio.gather(listener.server_task, listener.sync_task, listener.clipboard_task)
 
     except asyncio.CancelledError:
         print("\n⏹️ 主任务已取消")
@@ -1138,6 +1143,38 @@ def run_headless():
     asyncio.run(main())
 
 
+class MacTrayApp(rumps.App):
+    def __init__(self, host, open_panel_callback):
+        # Prefer the image if it exists, otherwise just text
+        icon_path = "unipaste.png"
+        if not os.path.exists(icon_path):
+             icon_path = None
+        super(MacTrayApp, self).__init__("UniPaste", icon=icon_path, quit_button=None)
+        self.host = host
+        self.open_panel_callback = open_panel_callback
+        self.menu = [
+            rumps.MenuItem("打开控制面板", callback=self.on_open_panel),
+            None,  # Separator
+            rumps.MenuItem("退出 UniPaste", callback=self.on_quit)
+        ]
+
+    def on_open_panel(self, _):
+        if self.open_panel_callback:
+            self.open_panel_callback()
+
+    def on_quit(self, _):
+        print("👋 正在通过菜单栏退出...")
+        self.host.stop()
+        rumps.quit_application()
+
+    def notify_pairing_request(self):
+        rumps.notification(
+            title="UniPaste 配对请求",
+            subtitle="有新设备请求配对",
+            message="请打开控制面板确认或拒绝请求"
+        )
+
+
 def run_control_panel():
     listener = ClipboardListener()
     autostart_manager = MacLaunchAgentManager(script_path=Path(__file__).resolve())
@@ -1146,11 +1183,33 @@ def run_control_panel():
         lambda service: asyncio.run(run_listener(service)),
         autostart_manager=autostart_manager,
     )
-    panel = ControlPanel(host, title="UniPaste 控制面板")
-    listener.ui_attention_callback = panel.focus
+
+    panel_state = {"thread": None, "panel": None}
+
+    def open_panel():
+        panel = panel_state.get("panel")
+        if panel and panel.root:
+            panel.focus()
+            return
+
+        def panel_main():
+            panel = ControlPanel(host, title="UniPaste 控制面板")
+            panel_state["panel"] = panel
+            try:
+                panel.run()
+            finally:
+                panel_state["panel"] = None
+
+        panel_thread = threading.Thread(target=panel_main, name="unipaste-control-panel", daemon=True)
+        panel_state["thread"] = panel_thread
+        panel_thread.start()
+
+    tray = MacTrayApp(host, open_panel)
+    listener.ui_attention_callback = tray.notify_pairing_request
+    
     host.start()
     try:
-        panel.run()
+        tray.run()
     finally:
         host.stop()
         host.join(5)

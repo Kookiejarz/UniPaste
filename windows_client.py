@@ -64,6 +64,8 @@ class WindowsClipboardClient:
         self.loop_guard = ClipboardLoopGuard()
         self.server_task = None
         self.clipboard_task = None
+        self.sync_task = None
+        self.status_task = None
         self.event_loop = None
         self.ui_attention_callback = None
         self.last_ui_error = None
@@ -273,12 +275,25 @@ class WindowsClipboardClient:
         # Save file cache
         if hasattr(self, 'file_handler'):
             self.file_handler.save_file_cache()
-        if hasattr(self, '_stop_server_func'):
-            if self.event_loop and self.event_loop.is_running():
+            
+        # Cancel tasks to wake up from sleep
+        if self.event_loop and self.event_loop.is_running():
+            for task_attr in ['server_task', 'clipboard_task', 'sync_task', 'status_task']:
+                task = getattr(self, task_attr, None)
+                if task and not task.done():
+                    self.event_loop.call_soon_threadsafe(task.cancel)
+            
+            if hasattr(self, '_stop_server_func'):
                 self.event_loop.call_soon_threadsafe(self._stop_server_func)
-            else:
+        else:
+            if hasattr(self, '_stop_server_func'):
                 self._stop_server_func()
-        # Cancel running tasks (handled in main loop)
+                
+        # Close all active connections
+        if self.peer_connections:
+            print(f"📤 正在关闭 {len(self.peer_connections)} 个连接...")
+            # We don't necessarily need to wait for these here as the tasks handling them are cancelled
+        
         print("👋 感谢使用 UniPaste!")
 
     def _register_peer(self, peer_id, websocket):
@@ -1105,17 +1120,17 @@ async def run_client_tasks(client: WindowsClipboardClient, include_status: bool 
     task_group = []
 
     if include_status:
-        status_task = asyncio.create_task(client.show_connection_status())
-        task_group.append(status_task)
+        client.status_task = asyncio.create_task(client.show_connection_status())
+        task_group.append(client.status_task)
 
     try:
         print("🚀 UniPaste Windows 节点已启动")
         print(f"📂 临时文件目录: {client.file_handler.temp_dir}")
         client.server_task = asyncio.create_task(client.start_server())
         client.clipboard_task = asyncio.create_task(client.send_clipboard_changes())
-        sync_task = asyncio.create_task(client.sync_clipboard())
-        task_group.extend([client.server_task, client.clipboard_task, sync_task])
-        await asyncio.gather(client.server_task, client.clipboard_task, sync_task)
+        client.sync_task = asyncio.create_task(client.sync_clipboard())
+        task_group.extend([client.server_task, client.clipboard_task, client.sync_task])
+        await asyncio.gather(client.server_task, client.clipboard_task, client.sync_task)
     finally:
         client.stop()
         for task in task_group:
