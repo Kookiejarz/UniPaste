@@ -1,55 +1,31 @@
 import asyncio
-import websockets
-import pyperclip
 import json
 import os
 import hmac
 import hashlib
 import sys
-import base64
 import time
 from pathlib import Path
-from utils.security.crypto import SecurityManager
+import threading
+import traceback
+
+import websockets
+
+from utils.security.auth import DeviceAuthManager
 from utils.network.discovery import DeviceDiscovery
 from utils.message_format import ClipMessage, MessageType
 from handlers.file_handler import FileHandler
 from utils.platform_config import verify_platform, IS_WINDOWS
+from utils.clipboard_utils import ClipboardUtils
 from config import ClipboardConfig
-from handlers.file_handler import FileHandler
-from utils.platform_config import verify_platform, IS_WINDOWS
-from config import ClipboardConfig
-import tempfile
-import traceback # Import traceback
+
+from utils.security.pairing import PairingManager, PairingStatus
 
 # Verify platform at startup
 verify_platform('windows')
 
-if IS_WINDOWS:
-    import win32clipboard
-    import win32con
-    from ctypes import Structure, c_uint, sizeof # For CF_HDROP
-    # Attempt to import optional COM libraries for fallback clipboard setting
-    try:
-        import pythoncom
-        from win32com.shell import shell, shellcon
-        HAS_WIN32COM = True
-    except ImportError:
-        HAS_WIN32COM = False
-        print("⚠️ 未找到 'pywin32' 的 COM 组件，文件剪贴板设置可能受限。")
-
-else:
-    # This should not happen due to verify_platform, but as a safeguard
+if not IS_WINDOWS:
     raise RuntimeError("This script requires Windows")
-
-
-# Define DROPFILES structure for CF_HDROP
-class DROPFILES(Structure):
-    _fields_ = [
-        ('pFiles', c_uint),  # offset of file list
-        ('pt', c_uint * 2),  # drop point (usually 0,0)
-        ('fNC', c_uint),     # is it on non-client area (usually 0)
-        ('fWide', c_uint),   # WIDE character flag (1 for Unicode)
-    ]
 
 class ConnectionStatus:
     """连接状态枚举"""
@@ -59,13 +35,15 @@ class ConnectionStatus:
 
 class WindowsClipboardClient:
     def __init__(self):
-        self.security_mgr = SecurityManager()
         self.discovery = DeviceDiscovery()
         self.ws_url = None
-        # self.last_clipboard_content = pyperclip.paste() # Less reliable, check dynamically
         self.is_receiving = False
         self.device_id = self._get_device_id()
+        self.device_name = os.environ.get('COMPUTERNAME', 'Windows设备')
         self.device_token = self._load_device_token()
+        self.auth_mgr = DeviceAuthManager()
+        self.pairing_mgr = PairingManager(timeout_seconds=60)
+        self.pairing_mgr.set_pairing_callback(self._on_pairing_request)
         self.running = True
         self.connection_status = ConnectionStatus.DISCONNECTED
         self.reconnect_delay = 3
@@ -79,17 +57,20 @@ class WindowsClipboardClient:
         self.last_remote_update_time = 0 # Timestamp of last *received* remote update
         self.ignore_clipboard_until = 0 # Timestamp until which local clipboard changes are ignored
         self._last_processed_content = None # Store last successfully processed text content
+        self.server = None
+        self.peer_connections = {}
+        self.websocket_peer_ids = {}
+        self.connection_security = {}
+        self.discovered_peers = {}
+        self.peer_platforms = {}
+        self.server_task = None
+        self.clipboard_task = None
 
-        # Initialize file handler
-        self.file_handler = FileHandler(
-            ClipboardConfig.get_temp_dir(), # Use config
-            self.security_mgr
-        )
-        self.file_handler.load_file_cache() # Load cache
+        self.file_handler = FileHandler(ClipboardConfig.get_temp_dir())
+        self.file_handler.load_file_cache()
 
     def _get_device_id(self):
         """获取唯一设备ID"""
-        # ... existing code ...
         import socket
         try:
             hostname = socket.gethostname()
@@ -107,7 +88,6 @@ class WindowsClipboardClient:
 
     def _get_token_path(self):
         """获取令牌存储路径"""
-        # ... existing code ...
         home_dir = Path.home()
         token_dir = home_dir / ".clipshare"
         token_dir.mkdir(parents=True, exist_ok=True)
@@ -115,7 +95,6 @@ class WindowsClipboardClient:
 
     def _load_device_token(self):
         """加载设备令牌"""
-        # ... existing code ...
         token_path = self._get_token_path()
         if token_path.exists():
             try:
@@ -127,7 +106,6 @@ class WindowsClipboardClient:
 
     def _save_device_token(self, token):
         """保存设备令牌"""
-        # ... existing code ...
         token_path = self._get_token_path()
         try:
             with open(token_path, "w") as f:
@@ -138,7 +116,6 @@ class WindowsClipboardClient:
 
     def _generate_signature(self):
         """生成签名"""
-        # ... existing code ...
         if not self.device_token:
             return ""
         try:
@@ -151,12 +128,66 @@ class WindowsClipboardClient:
              print(f"❌ 生成签名失败: {e}")
              return ""
 
-    # Removed _init_encryption (handled by SecurityManager)
+    def _on_pairing_request(self, request):
+        print(f"\n{'='*60}")
+        print("🔗 新设备请求配对:")
+        print(f"   设备名称: {request.device_name}")
+        print(f"   平台: {request.platform}")
+        print(f"   IP地址: {request.ip_address}")
+        print(f"   设备ID: {request.device_id}")
+        print(f"{'='*60}")
+        print("是否允许此设备连接? (输入 'y' 接受, 'n' 拒绝)")
+
+        def get_user_input():
+            try:
+                choice = input().strip().lower()
+                if choice in ['y', 'yes', 'accept', '是', '接受']:
+                    self.pairing_mgr.accept_pairing(request.device_id)
+                else:
+                    self.pairing_mgr.reject_pairing(request.device_id)
+            except Exception:
+                self.pairing_mgr.reject_pairing(request.device_id)
+
+        threading.Thread(target=get_user_input, daemon=True).start()
+
+    def _should_initiate_connection(self, peer_id: str) -> bool:
+        return bool(peer_id) and peer_id != self.device_id and self.device_id > peer_id
+
+    def _update_connection_status(self):
+        if self.peer_connections:
+            self.connection_status = ConnectionStatus.CONNECTED
+        elif self.ws_url:
+            self.connection_status = ConnectionStatus.CONNECTING
+        else:
+            self.connection_status = ConnectionStatus.DISCONNECTED
+
+    def on_service_found(self, service_info):
+        """服务发现回调"""
+        self.last_discovery_time = time.time()
+        if isinstance(service_info, str):
+            service_info = {"url": service_info, "properties": {}}
+
+        url = service_info.get("url")
+        properties = service_info.get("properties", {})
+        peer_id = properties.get("device_id")
+        platform = properties.get("platform", "unknown")
+
+        if not url or not peer_id or peer_id == self.device_id:
+            return
+
+        self.discovered_peers[peer_id] = {
+            "url": url,
+            "platform": platform,
+        }
+        self.peer_platforms[peer_id] = platform
+        if self._should_initiate_connection(peer_id):
+            self.ws_url = url
+        print(f"✅ 发现设备 {peer_id} ({platform}): {url}")
 
     def stop(self):
-        """停止客户端运行"""
+        """停止节点运行"""
         if not self.running: return
-        print("\n⏹️ 正在停止客户端...")
+        print("\n⏹️ 正在停止节点...")
         self.running = False
         # Close discovery
         if hasattr(self, 'discovery'):
@@ -164,15 +195,214 @@ class WindowsClipboardClient:
         # Save file cache
         if hasattr(self, 'file_handler'):
             self.file_handler.save_file_cache()
+        if hasattr(self, '_stop_server_func'):
+            self._stop_server_func()
         # Cancel running tasks (handled in main loop)
         print("👋 感谢使用 UniPaste!")
 
-    def on_service_found(self, ws_url):
-        """服务发现回调"""
-        # ... existing code ...
-        self.last_discovery_time = time.time()
-        print(f"✅ 发现剪贴板服务: {ws_url}")
-        self.ws_url = ws_url
+    def _register_peer(self, peer_id, websocket):
+        existing = self.peer_connections.get(peer_id)
+        if existing and existing != websocket:
+            return False
+        self.peer_connections[peer_id] = websocket
+        self.websocket_peer_ids[websocket] = peer_id
+        self._update_connection_status()
+        return True
+
+    def _unregister_peer(self, websocket):
+        peer_id = self.websocket_peer_ids.pop(websocket, None)
+        if peer_id and self.peer_connections.get(peer_id) == websocket:
+            del self.peer_connections[peer_id]
+        self.connection_security.pop(websocket, None)
+        self._update_connection_status()
+        return peer_id
+
+    def _get_connection_security(self, websocket, create=False):
+        manager = self.connection_security.get(websocket)
+        if manager is None and create:
+            manager = SecurityManager()
+            manager.generate_key_pair()
+            self.connection_security[websocket] = manager
+        return manager
+
+    async def broadcast_encrypted_data(self, data_to_encrypt: bytes, exclude_websocket=None):
+        if not self.peer_connections:
+            return
+
+        tasks = []
+        for websocket in list(self.peer_connections.values()):
+            if websocket == exclude_websocket:
+                continue
+            security_mgr = self._get_connection_security(websocket)
+            if not security_mgr or not security_mgr.has_shared_key():
+                continue
+            try:
+                encrypted_data = security_mgr.encrypt_message(data_to_encrypt)
+            except Exception as e:
+                print(f"❌ 加密广播数据失败: {e}")
+                continue
+            tasks.append(asyncio.create_task(websocket.send(encrypted_data)))
+
+        if tasks:
+            done, pending = await asyncio.wait(tasks, timeout=10.0)
+            for task in pending:
+                task.cancel()
+            for task in done:
+                if task.exception():
+                    print(f"❌ 广播发送时出错: {task.exception()}")
+
+    async def send_current_clipboard_to_peer(self, websocket):
+        async def send_direct(data):
+            await self._send_encrypted(data, websocket)
+
+        try:
+            file_paths = ClipboardUtils.get_clipboard_files()
+            if file_paths:
+                await self.file_handler.handle_clipboard_files(
+                    file_paths,
+                    None,
+                    send_direct,
+                    origin_device_id=self.device_id,
+                    event_id=ClipMessage.new_event_id()
+                )
+                print("📤 已向新连接设备发送当前文件剪贴板快照")
+                return
+
+            text = ClipboardUtils.get_clipboard_text()
+            if text:
+                await self.file_handler.process_clipboard_content(
+                    text,
+                    time.time(),
+                    None,
+                    0,
+                    send_direct,
+                    origin_device_id=self.device_id,
+                    event_id=ClipMessage.new_event_id()
+                )
+                print("📤 已向新连接设备发送当前文本剪贴板快照")
+        except Exception as e:
+            print(f"⚠️ 发送当前剪贴板快照失败: {e}")
+
+    async def start_server(self, port=ClipboardConfig.DEFAULT_PORT):
+        stop_event = asyncio.Event()
+
+        async def server_logic():
+            try:
+                self.server = await websockets.serve(
+                    self.handle_client,
+                    ClipboardConfig.HOST,
+                    port,
+                    subprotocols=["binary"],
+                    ping_interval=20,
+                    ping_timeout=20
+                )
+                await self.discovery.start_advertising(
+                    port,
+                    device_id=self.device_id,
+                    platform="windows"
+                )
+                print(f"🌐 Windows 对等节点监听在 {ClipboardConfig.HOST}:{port}")
+                await stop_event.wait()
+            finally:
+                if self.server:
+                    self.server.close()
+                    await self.server.wait_closed()
+                    self.server = None
+
+        self._stop_server_func = stop_event.set
+        await server_logic()
+
+    async def _authenticate_incoming(self, websocket):
+        device_id = None
+        client_ip = websocket.remote_address[0] if websocket.remote_address else "未知IP"
+        auth_message = await websocket.recv()
+
+        if isinstance(auth_message, str):
+            message_data = json.loads(auth_message)
+        else:
+            message_data = json.loads(auth_message.decode("utf-8"))
+
+        device_id = message_data.get("identity", f"unknown-{client_ip}")
+        signature = message_data.get("signature", "")
+        is_first_time = message_data.get("first_time", False)
+
+        print(f"📱 设备 {device_id} ({client_ip}) 尝试连接")
+
+        if is_first_time:
+            print(f"🆕 设备 {device_id} 首次连接，需要配对...")
+            await self.pairing_mgr.request_pairing(device_id, message_data, client_ip)
+            pairing_result = await self.pairing_mgr.wait_for_pairing_result(device_id)
+            if pairing_result == PairingStatus.ACCEPTED:
+                token = self.auth_mgr.authorize_device(device_id, {
+                    "name": message_data.get("device_name", "未命名设备"),
+                    "platform": message_data.get("platform", "未知平台"),
+                    "ip": client_ip,
+                })
+                await websocket.send(json.dumps({
+                    "status": "pairing_accepted",
+                    "peer_id": self.device_id,
+                    "token": token,
+                }))
+                return device_id, message_data
+            if pairing_result == PairingStatus.REJECTED:
+                await websocket.send(json.dumps({
+                    "status": "pairing_rejected",
+                    "reason": "User rejected pairing request",
+                    "peer_id": self.device_id,
+                }))
+                return None, None
+
+            await websocket.send(json.dumps({
+                "status": "pairing_expired",
+                "reason": "Pairing request timed out",
+                "peer_id": self.device_id,
+            }))
+            return None, None
+
+        print(f"🔐 验证设备 {device_id} 的签名")
+        if not self.auth_mgr.validate_device(device_id, signature):
+            await websocket.send(json.dumps({
+                "status": "unauthorized",
+                "reason": "Invalid signature or unknown device",
+                "peer_id": self.device_id,
+            }))
+            return None, None
+
+        await websocket.send(json.dumps({
+            "status": "authorized",
+            "peer_id": self.device_id,
+        }))
+        return device_id, message_data
+
+    async def handle_client(self, websocket):
+        peer_id = None
+        try:
+            peer_id, _ = await self._authenticate_incoming(websocket)
+            if not peer_id:
+                return
+
+            if not await self.perform_key_exchange_as_server(websocket):
+                print(f"❌ 与 {peer_id} 的密钥交换失败，断开连接")
+                return
+
+            if not self._register_peer(peer_id, websocket):
+                print(f"⚠️ 已存在与 {peer_id} 的连接，关闭重复入站连接")
+                await websocket.close()
+                return
+
+            print(f"✅ 设备 {peer_id} 已连接并完成密钥交换")
+            await self.send_current_clipboard_to_peer(websocket)
+            await self.receive_clipboard_changes(websocket)
+
+        except websockets.exceptions.ConnectionClosed as e:
+            print(f"📴 设备 {peer_id or 'unknown'} 连接已关闭: {e}")
+        except Exception as e:
+            print(f"❌ 处理入站连接时出错: {e}")
+            traceback.print_exc()
+        finally:
+            removed_peer = self._unregister_peer(websocket)
+            if removed_peer:
+                print(f"➖ 设备 {removed_peer} 已断开")
 
     async def sync_clipboard(self):
         """主同步循环，处理连接和重连"""
@@ -180,73 +410,32 @@ class WindowsClipboardClient:
         self.discovery.start_discovery(self.on_service_found)
 
         while self.running:
-            # Log loop start state
-            print(f"DEBUG: Main loop - Status: {self.connection_status}, URL: {self.ws_url}")
             try:
-                if self.connection_status == ConnectionStatus.DISCONNECTED:
-                    if not self.ws_url:
-                        # print("DEBUG: No URL, waiting for discovery...") # Optional more verbose log
-                        await asyncio.sleep(1.0) # Longer sleep when waiting for discovery
+                connected_peer_ids = set(self.peer_connections.keys())
+                candidate_peer_id = None
+                candidate_url = None
+                for peer_id, peer_info in sorted(self.discovered_peers.items()):
+                    if not self._should_initiate_connection(peer_id):
                         continue
+                    if peer_id in connected_peer_ids:
+                        continue
+                    candidate_peer_id = peer_id
+                    candidate_url = peer_info.get("url")
+                    break
 
+                if candidate_peer_id and candidate_url:
+                    self.ws_url = candidate_url
                     self.connection_status = ConnectionStatus.CONNECTING
-                    print(f"🔌 正在连接到服务器: {self.ws_url}")
-
+                    print(f"🔌 正在连接到设备 {candidate_peer_id}: {candidate_url}")
                     try:
-                        # REMOVED: async with asyncio.timeout(15):
-                        # Call connect_and_sync directly without the outer timeout
-                        await self.connect_and_sync()
-
-                        # If connect_and_sync returns normally, it means connection closed gracefully
-                        print("ℹ️ 连接已关闭，将尝试重新发现和连接。")
-                        # Status is already set to DISCONNECTED inside connect_and_sync
-                        # self.connection_status = ConnectionStatus.DISCONNECTED
-                        self.ws_url = None # Reset URL to trigger rediscovery
-                        print("DEBUG: Restarting discovery after normal close.") # Add log
-                        self.discovery.stop_browser() # Stop browser, don't close zeroconf yet
-                        self.discovery.start_discovery(self.on_service_found) # Start new discovery
-                        await asyncio.sleep(1) # Brief pause before rediscovery
-
-                    except asyncio.TimeoutError:
-                         # ... existing code ...
-                         print(f"❌ 连接或初始握手超时: {self.ws_url}")
-                         self.connection_status = ConnectionStatus.DISCONNECTED
-                         self.ws_url = None # Reset URL
-                         print("DEBUG: Stopping browser before wait_for_reconnect (TimeoutError).") # Add log
-                         self.discovery.stop_browser() # Stop browser before waiting
-                         print("DEBUG: Triggering wait_for_reconnect due to TimeoutError.") # Add log
-                         await self.wait_for_reconnect() # wait_for_reconnect will restart discovery
-                    except websockets.exceptions.InvalidURI:
-                         print(f"❌ 无效的服务地址: {self.ws_url}")
-                         self.connection_status = ConnectionStatus.DISCONNECTED
-                         self.ws_url = None
-                         # No reconnect wait here, just sleep and retry discovery
-                         print("DEBUG: Restarting discovery after InvalidURI.") # Add log
-                         self.discovery.stop_browser() # Stop browser
-                         self.discovery.start_discovery(self.on_service_found) # Start new discovery
-                         await asyncio.sleep(2) # Wait before rediscovery
-                    except websockets.exceptions.WebSocketException as e:
-                         # Catches connection failures (e.g., ConnectionRefusedError)
-                         print(f"❌ WebSocket 连接错误: {e}")
-                         self.connection_status = ConnectionStatus.DISCONNECTED
-                         self.ws_url = None
-                         print(f"DEBUG: Stopping browser before wait_for_reconnect (WebSocketException: {e})") # Add log
-                         self.discovery.stop_browser() # Stop browser before waiting
-                         print(f"DEBUG: Triggering wait_for_reconnect due to WebSocketException: {e}") # Add log
-                         await self.wait_for_reconnect() # wait_for_reconnect will restart discovery
+                        await self.connect_and_sync(candidate_peer_id, candidate_url)
                     except Exception as e:
-                        # Catch other unexpected errors during the connection attempt/management phase
-                        print(f"❌ 连接或同步时发生意外错误: {e}")
+                        print(f"❌ 与设备 {candidate_peer_id} 建立连接失败: {e}")
                         traceback.print_exc()
-                        self.connection_status = ConnectionStatus.DISCONNECTED
-                        self.ws_url = None
-                        print(f"DEBUG: Stopping browser before wait_for_reconnect (Exception: {e})") # Add log
-                        self.discovery.stop_browser() # Stop browser before waiting
-                        print(f"DEBUG: Triggering wait_for_reconnect due to Exception: {e}") # Add log
-                        await self.wait_for_reconnect() # wait_for_reconnect will restart discovery
+                        await self.wait_for_reconnect()
                 else:
-                    # Still connected or connecting, short sleep
-                    await asyncio.sleep(ClipboardConfig.CLIPBOARD_CHECK_INTERVAL)
+                    self._update_connection_status()
+                await asyncio.sleep(ClipboardConfig.CLIPBOARD_CHECK_INTERVAL)
 
             except asyncio.CancelledError:
                 print("🛑 同步任务被取消")
@@ -259,7 +448,6 @@ class WindowsClipboardClient:
 
     async def wait_for_reconnect(self):
         """等待重连，使用指数退避策略"""
-        # ... existing code ...
         current_time = time.time()
         # Reset delay if discovery was recent
         if current_time - self.last_discovery_time < 10:
@@ -285,64 +473,46 @@ class WindowsClipboardClient:
              self.discovery.start_discovery(self.on_service_found)
 
 
-    async def connect_and_sync(self):
-        """连接到服务器并同步剪贴板"""
+    async def connect_and_sync(self, peer_id, ws_url):
+        """主动连接到对等设备并处理消息"""
         # Specify binary subprotocol and increase max message size
         async with websockets.connect(
-            self.ws_url,
+            ws_url,
             subprotocols=["binary"],
             max_size= 10 * 1024 * 1024, # Allow larger messages (e.g., 10MB) for file chunks
             ping_interval=20,
             ping_timeout=20
         ) as websocket:
             # --- Authentication ---
-            if not await self.authenticate(websocket):
+            remote_peer_id = await self.authenticate(websocket)
+            if not remote_peer_id:
                 print("❌ 身份验证失败，断开连接")
                 return # Close connection
 
             # --- Key Exchange ---
-            if not await self.perform_key_exchange(websocket):
+            if not await self.perform_key_exchange_as_client(websocket):
                 print("❌ 密钥交换失败，断开连接")
                 return # Close connection
 
-            # --- Connection Successful ---
-            self.reconnect_delay = 3 # Reset reconnect delay on success
+            if not self._register_peer(remote_peer_id, websocket):
+                print(f"⚠️ 已存在与 {remote_peer_id} 的连接，关闭重复出站连接")
+                return
+
+            self.reconnect_delay = 3
             self.connection_status = ConnectionStatus.CONNECTED
-            print("✅ 连接和密钥交换成功，开始同步剪贴板")
-
-            # --- Start Send/Receive Tasks ---
-            send_task = asyncio.create_task(self.send_clipboard_changes(websocket))
-            receive_task = asyncio.create_task(self.receive_clipboard_changes(websocket))
-
-            # Monitor tasks until one exits or client stops
-            done, pending = await asyncio.wait(
-                [send_task, receive_task],
-                return_when=asyncio.FIRST_COMPLETED
-            )
-
-            # --- Cleanup ---
-            print("ℹ️ 同步任务结束，正在取消其他任务...")
-            for task in pending:
-                task.cancel()
-            # Wait for pending tasks to cancel
-            if pending:
-                 await asyncio.wait(pending)
-
-            # Check for exceptions in completed tasks
-            for task in done:
-                 if task.exception():
-                      print(f"❌ 同步任务异常退出: {task.exception()}")
-                      traceback.print_exc()
-
-            print("ℹ️ 同步会话结束")
-            # Always set status to DISCONNECTED before returning
-            self.connection_status = ConnectionStatus.DISCONNECTED
-            # Connection will close automatically when 'async with' block exits
+            self.last_content_hash = None
+            print(f"✅ 已连接到设备 {remote_peer_id}，开始同步剪贴板")
+            await self.send_current_clipboard_to_peer(websocket)
+            try:
+                await self.receive_clipboard_changes(websocket)
+            finally:
+                removed_peer = self._unregister_peer(websocket)
+                if removed_peer:
+                    print(f"➖ 设备 {removed_peer} 已断开")
 
 
     async def authenticate(self, websocket):
-        """与服务器进行身份验证"""
-        # ... existing code ...
+        """与对等设备进行身份验证"""
         try:
             is_first_time = self.device_token is None
 
@@ -356,7 +526,7 @@ class WindowsClipboardClient:
 
             if is_first_time:
                 print(f"🔗 首次连接设备 ID: {self.device_id}")
-                print("正在请求与服务器配对...")
+                print("正在请求与对端配对...")
             else:
                 print(f"🔑 已注册设备 ID: {self.device_id}")
                 
@@ -374,75 +544,44 @@ class WindowsClipboardClient:
             status = response_data.get('status')
 
             if status == 'authorized':
-                print(f"✅ 身份验证成功! 服务器: {response_data.get('server_id', '未知')}")
-                return True
+                print(f"✅ 身份验证成功! 对端: {response_data.get('peer_id', '未知')}")
+                return response_data.get("peer_id")
             elif status == 'pairing_accepted':
                 token = response_data.get('token')
                 if token:
                     self._save_device_token(token)
                     self.device_token = token
                     print(f"🎉 设备配对成功并获取授权令牌!")
-                    return True
+                    return response_data.get("peer_id")
                 else:
-                    print(f"❌ 服务器在配对成功时未提供令牌")
-                    return False
+                    print(f"❌ 对端在配对成功时未提供令牌")
+                    return None
             elif status == 'pairing_rejected':
-                print(f"❌ 配对被服务器拒绝: {response_data.get('reason', '未知原因')}")
-                return False
+                print(f"❌ 配对被对端拒绝: {response_data.get('reason', '未知原因')}")
+                return None
             elif status == 'pairing_expired':
                 print(f"⏰ 配对请求超时: {response_data.get('reason', '未知原因')}")
-                print("请重新尝试连接并确保及时在服务器端确认配对")
-                return False
+                print("请重新尝试连接并确保及时在对端确认配对")
+                return None
             else:
                 reason = response_data.get('reason', '未知原因')
                 print(f"❌ 身份验证失败: {reason}")
-                return False
+                return None
                 
         except asyncio.TimeoutError:
-            print("❌ 等待配对响应超时 (可能需要在服务器端手动确认)")
-            return False
+            print("❌ 等待配对响应超时 (可能需要在对端手动确认)")
+            return None
         except Exception as e:
             print(f"❌ 身份验证过程中出错: {e}")
-            return False
-
-    def _get_clipboard_file_paths(self):
-        """从剪贴板获取文件路径列表 (Windows specific)"""
-        try:
-            win32clipboard.OpenClipboard()
-            try:
-                if (win32clipboard.IsClipboardFormatAvailable(win32con.CF_HDROP)):
-                    data = win32clipboard.GetClipboardData(win32con.CF_HDROP)
-                    if data:
-                        # Data is a tuple of file paths
-                        paths = [str(p) for p in data if Path(p).exists()] # Ensure paths exist
-                        if paths:
-                             # Simple logging, hash check done in send_clipboard_changes
-                             # print(f"📎 剪贴板中包含 {len(paths)} 个文件")
-                             return paths
-                # else: # Less verbose logging for non-file formats
-                #     # ... (optional logging of other formats) ...
-                #     pass
-            finally:
-                win32clipboard.CloseClipboard()
-                
-        except Exception as e:
-            # Handle specific pywintypes.error if needed
-            if "OpenClipboard" in str(e) or "GetClipboardData" in str(e):
-                 print(f"⚠️ 无法访问剪贴板: {e} (可能被其他应用占用)")
-                 # Avoid flooding logs if clipboard is busy
-                 time.sleep(0.5)
-            else:
-                 print(f"❌ 读取剪贴板文件失败: {e}")
-                 traceback.print_exc()
-        return None # Return None if no files or error
-
-    # Removed _set_clipboard_file_paths (logic moved to _handle_file_response)
-    # Removed _normalize_path (Path() handles this)
+            return None
 
     async def _send_encrypted(self, data: bytes, websocket):
         """Helper to encrypt and send data via the websocket."""
         try:
-            encrypted = self.security_mgr.encrypt_message(data)
+            security_mgr = self._get_connection_security(websocket)
+            if not security_mgr or not security_mgr.has_shared_key():
+                raise ValueError("Connection shared key not established")
+            encrypted = security_mgr.encrypt_message(data)
             await websocket.send(encrypted)
         except websockets.exceptions.ConnectionClosed:
              print("❌ 发送数据失败：连接已关闭")
@@ -456,17 +595,20 @@ class WindowsClipboardClient:
             raise # Re-raise
 
 
-    async def send_clipboard_changes(self, websocket):
+    async def send_clipboard_changes(self):
         """监控并发送剪贴板变化"""
         last_send_attempt_time = 0
 
-        # Wrapper function for FileHandler
         async def send_encrypted_wrapper(data_to_encrypt: bytes):
-            await self._send_encrypted(data_to_encrypt, websocket)
+            await self.broadcast_encrypted_data(data_to_encrypt)
 
-        while self.running and self.connection_status == ConnectionStatus.CONNECTED:
+        while self.running:
             try:
                 current_time = time.time()
+
+                if not self.peer_connections:
+                    await asyncio.sleep(ClipboardConfig.CLIPBOARD_CHECK_INTERVAL)
+                    continue
 
                 # Ignore if we are currently processing a received update
                 if self.is_receiving:
@@ -487,35 +629,23 @@ class WindowsClipboardClient:
                 sent_update_this_cycle = False
 
                 # --- Check for Files ---
-                file_paths = self._get_clipboard_file_paths()
+                file_paths = ClipboardUtils.get_clipboard_files()
                 if file_paths:
-                    # Calculate hash of current file paths *content*
                     content_hash = self.file_handler.get_files_content_hash(file_paths)
 
-                    # Check if content hash is valid and different from last sent hash
                     if content_hash and content_hash != self.last_content_hash:
-                        #print(f"📋 检测到剪贴板文件变化 (Hash: {content_hash[:8]}...)")
-                        # Send file info message
                         new_hash, update_sent = await self.file_handler.handle_clipboard_files(
                             file_paths,
                             self.last_content_hash,
-                            send_encrypted_wrapper # Pass the wrapper
+                            send_encrypted_wrapper,
+                            origin_device_id=self.device_id,
+                            event_id=ClipMessage.new_event_id()
                         )
                         if update_sent:
                             self.last_content_hash = new_hash # Update hash after sending info
                             self.last_update_time = time.time()
                             sent_update_this_cycle = True
-                            # Initiate file transfer after sending info
-                            print("🔄 准备主动传输文件内容...")
-                            try:
-                                for file_path in file_paths:
-                                    await self.file_handler.handle_file_transfer(
-                                        file_path, send_encrypted_wrapper # Pass wrapper
-                                    )
-                            except Exception as transfer_err:
-                                 print(f"❌ 文件传输过程中断: {transfer_err}")
-                                 # Connection status likely updated in _send_encrypted
-                                 break # Exit send loop
+                            print("📤 文件信息已发送，等待对端按需请求内容...")
 
                     # If files handled, skip text check for this cycle
                     if sent_update_this_cycle:
@@ -524,11 +654,7 @@ class WindowsClipboardClient:
 
 
                 # --- Check for Text (if no files were sent) ---
-                try:
-                    current_content = pyperclip.paste()
-                except pyperclip.PyperclipException as e:
-                     print(f"⚠️ 无法读取剪贴板文本: {e}")
-                     current_content = None # Treat as no text content
+                current_content = ClipboardUtils.get_clipboard_text()
 
                 # Process only if text content exists and is different from last processed
                 if current_content and current_content != self._last_processed_content:
@@ -547,7 +673,9 @@ class WindowsClipboardClient:
                             current_time,
                             self.last_content_hash,
                             self.last_update_time,
-                            send_encrypted_wrapper # Pass the wrapper
+                            send_encrypted_wrapper,
+                            origin_device_id=self.device_id,
+                            event_id=ClipMessage.new_event_id()
                         )
                         if update_sent:
                             self.last_content_hash = new_hash
@@ -559,36 +687,31 @@ class WindowsClipboardClient:
                 if not sent_update_this_cycle:
                     await asyncio.sleep(ClipboardConfig.CLIPBOARD_CHECK_INTERVAL)
 
-            except websockets.exceptions.ConnectionClosed:
-                 print("ℹ️ 发送循环检测到连接关闭")
-                 break # Exit loop naturally
             except asyncio.CancelledError:
                 print("⏹️ 发送任务被取消")
                 break
             except Exception as e:
                 print(f"❌ 发送剪贴板变化时出错: {e}")
                 traceback.print_exc()
-                # Check connection status and potentially break
-                if self.connection_status != ConnectionStatus.CONNECTED:
-                     print("❌ 连接丢失，停止发送循环")
-                     break
                 await asyncio.sleep(1) # Avoid tight loop on error
 
 
     async def receive_clipboard_changes(self, websocket):
-        """接收来自服务器的剪贴板变化"""
-        # Wrapper function for FileHandler to send requests back to server
+        """接收来自对等设备的剪贴板变化"""
         async def send_encrypted_wrapper(data_to_encrypt: bytes):
             await self._send_encrypted(data_to_encrypt, websocket)
 
-        while self.running and self.connection_status == ConnectionStatus.CONNECTED:
+        while self.running:
             try:
                 # Receive data with timeout
                 received_data = await asyncio.wait_for(websocket.recv(), timeout=30.0)
                 self.is_receiving = True # Set flag
 
                 # Decrypt and process
-                decrypted_data = self.security_mgr.decrypt_message(received_data)
+                security_mgr = self._get_connection_security(websocket)
+                if not security_mgr or not security_mgr.has_shared_key():
+                    raise ValueError("Connection shared key not established")
+                decrypted_data = security_mgr.decrypt_message(received_data)
                 message_json = decrypted_data.decode('utf-8')
                 message = ClipMessage.deserialize(message_json)
 
@@ -597,6 +720,9 @@ class WindowsClipboardClient:
                      continue # Skip this message
 
                 msg_type = message["type"]
+                origin_device_id = message.get("origin_device_id")
+                if origin_device_id and origin_device_id == self.device_id:
+                    continue
                 print(f"📬 收到消息类型: {msg_type}")
 
                 if msg_type == MessageType.TEXT:
@@ -606,18 +732,29 @@ class WindowsClipboardClient:
                     await self.file_handler.handle_received_files(
                          message, send_encrypted_wrapper, sender_websocket=websocket
                     )
+                elif msg_type == MessageType.FILE_START:
+                    await self.file_handler.handle_transfer_start(message)
                 elif msg_type == MessageType.FILE_RESPONSE:
                     # Handle incoming file chunk
-                    await self._handle_file_response(message)
+                    await self._handle_file_response(message, send_encrypted_wrapper)
+                elif msg_type == MessageType.FILE_CHUNK:
+                    await self._handle_file_response(message, send_encrypted_wrapper)
                 elif msg_type == MessageType.FILE_REQUEST:
-                     # Server is requesting a file from us
+                     # Peer is requesting a file from us
                      file_path_requested = message.get("path")
+                     resume_from_chunk = int(message.get("resume_from_chunk") or 0)
+                     transfer_id = message.get("transfer_id")
+                     event_id = message.get("event_id")
+                     request_origin = message.get("origin_device_id")
                      if file_path_requested:
                           print(f"📤 收到文件请求: {Path(file_path_requested).name}")
-                          # Send file chunks back to server via wrapper
                           await self.file_handler.handle_file_transfer(
                                file_path_requested,
-                               send_encrypted_wrapper
+                               send_encrypted_wrapper,
+                               start_chunk=resume_from_chunk,
+                               transfer_id=transfer_id,
+                               origin_device_id=request_origin,
+                               event_id=event_id
                           )
                      else:
                           print("⚠️ 收到的文件请求缺少路径")
@@ -631,17 +768,14 @@ class WindowsClipboardClient:
                       pong_waiter = await websocket.ping()
                       await asyncio.wait_for(pong_waiter, timeout=5)
                  except (asyncio.TimeoutError, websockets.exceptions.ConnectionClosed):
-                      print("⌛ 与服务器的连接超时或关闭，断开")
-                      self.connection_status = ConnectionStatus.DISCONNECTED
+                      print("⌛ 与对端的连接超时或关闭，断开")
                       break # Exit receive loop
                  continue # Continue loop after successful ping/pong
             except websockets.exceptions.ConnectionClosedOK:
                  print("ℹ️ 接收循环检测到连接正常关闭")
-                 self.connection_status = ConnectionStatus.DISCONNECTED
                  break
             except websockets.exceptions.ConnectionClosedError as e:
                  print(f"🔌 接收循环检测到连接异常关闭: {e}")
-                 self.connection_status = ConnectionStatus.DISCONNECTED
                  break
             except asyncio.CancelledError:
                 print("⏹️ 接收任务被取消")
@@ -653,54 +787,44 @@ class WindowsClipboardClient:
             except Exception as e:
                 print(f"❌ 处理接收数据时出错: {e}")
                 traceback.print_exc()
-                # Avoid tight loop on error, check connection
-                if self.connection_status != ConnectionStatus.CONNECTED:
-                     break
                 await asyncio.sleep(1)
             finally:
                  self.is_receiving = False # Reset flag
 
 
-    async def perform_key_exchange(self, websocket):
-        """Execute key exchange with server"""
+    async def perform_key_exchange_as_client(self, websocket):
+        """作为主动连接方执行密钥交换"""
         try:
-            # Generate keys if needed
-            if not self.security_mgr.private_key:
-                self.security_mgr.generate_key_pair()
+            security_mgr = self._get_connection_security(websocket, create=True)
 
-            # Wait for server's public key with timeout
-            server_key_message = await asyncio.wait_for(websocket.recv(), timeout=10.0)
-            server_data = json.loads(server_key_message)
+            peer_key_message = await asyncio.wait_for(websocket.recv(), timeout=10.0)
+            peer_data = json.loads(peer_key_message)
 
-            if server_data.get("type") != "key_exchange":
-                print("❌ 服务器未按预期发送公钥")
+            if peer_data.get("type") != "key_exchange":
+                print("❌ 对端未按预期发送公钥")
                 return False
 
-            # Deserialize server's public key
-            server_key_data = server_data.get("public_key")
-            server_public_key = self.security_mgr.deserialize_public_key(server_key_data)
+            peer_key_data = peer_data.get("public_key")
+            peer_public_key = security_mgr.deserialize_public_key(peer_key_data)
 
-            # Send our public key
-            client_public_key = self.security_mgr.serialize_public_key()
+            client_public_key = security_mgr.serialize_public_key()
             await websocket.send(json.dumps({
                 "type": "key_exchange",
                 "public_key": client_public_key
             }))
-            print("📤 已发送客户端公钥")
+            print("📤 已发送本端公钥")
 
-            # Generate shared key
-            self.security_mgr.generate_shared_key(server_public_key)
+            security_mgr.generate_shared_key(peer_public_key)
             print("🔒 密钥交换完成，已建立共享密钥")
 
-            # Wait for confirmation with timeout
             confirmation = await asyncio.wait_for(websocket.recv(), timeout=10.0)
             confirm_data = json.loads(confirmation)
 
             if confirm_data.get("type") == "key_exchange_complete" and confirm_data.get("status") == "success":
-                print("✅ 服务器确认密钥交换成功")
+                print("✅ 对端确认密钥交换成功")
                 return True
             else:
-                print("⚠️ 未收到服务器的密钥交换成功确认")
+                print("⚠️ 未收到对端的密钥交换成功确认")
                 return False
 
         except asyncio.TimeoutError:
@@ -714,14 +838,26 @@ class WindowsClipboardClient:
             traceback.print_exc()
             return False
 
-    # Removed request_file_retry (handled by standard file request mechanism)
+    async def perform_key_exchange_as_server(self, websocket):
+        """作为接收连接方执行密钥交换"""
+        security_mgr = self._get_connection_security(websocket, create=True)
+
+        async def send_to_websocket(data):
+            await websocket.send(data)
+
+        async def receive_from_websocket():
+            return await websocket.recv()
+
+        return await security_mgr.perform_key_exchange(
+            send_to_websocket,
+            receive_from_websocket
+        )
 
     async def show_connection_status(self):
         """显示连接状态"""
-        # ... existing code ...
         last_status = None
         status_messages = {
-            ConnectionStatus.DISCONNECTED: "🔴 已断开连接 - 等待服务器",
+            ConnectionStatus.DISCONNECTED: "🔴 已断开连接 - 等待对等设备",
             ConnectionStatus.CONNECTING: "🟡 正在连接...",
             ConnectionStatus.CONNECTED: "🟢 已连接 - 剪贴板同步已激活"
         }
@@ -754,9 +890,6 @@ class WindowsClipboardClient:
                  await asyncio.sleep(2)
 
 
-    # Removed _looks_like_temp_file_path (moved to FileHandler)
-    # Removed _display_progress (moved to FileHandler)
-
     async def _handle_text_message(self, message):
         """处理收到的文本消息"""
         try:
@@ -777,101 +910,33 @@ class WindowsClipboardClient:
                 print("⏭️ 跳过重复内容 (与本地最后发送/设置一致)")
                 return
 
-            # Update clipboard
-            try:
-                pyperclip.copy(text)
-                # Update state *after* successful clipboard operation
-                self.last_content_hash = content_hash # Mark this hash as processed locally
-                self.last_update_time = time.time() # Mark time of local update
-                self.ignore_clipboard_until = time.time() + ClipboardConfig.UPDATE_DELAY # Ignore local changes briefly
-                self._last_processed_content = text # Store last processed text
+            if not ClipboardUtils.set_clipboard_text(text):
+                print("❌ 更新Windows文本剪贴板失败")
+                return
 
-                # Record hash and time from remote sender for loop detection
-                self.last_remote_content_hash = content_hash
-                self.last_remote_update_time = time.time()
+            self.last_content_hash = content_hash
+            self.last_update_time = time.time()
+            self.ignore_clipboard_until = time.time() + ClipboardConfig.UPDATE_DELAY
+            self._last_processed_content = text
 
-                # Display received text
-                display_text = text[:ClipboardConfig.MAX_DISPLAY_LENGTH] + ("..." if len(text) > ClipboardConfig.MAX_DISPLAY_LENGTH else "")
-                print(f"📥 已复制文本: \"{display_text}\"")
+            self.last_remote_content_hash = content_hash
+            self.last_remote_update_time = time.time()
 
-            except pyperclip.PyperclipException as e:
-                 print(f"❌ 更新剪贴板失败: {e}")
-                 # Potentially retry or log more details
-
+            display_text = text[:ClipboardConfig.MAX_DISPLAY_LENGTH] + ("..." if len(text) > ClipboardConfig.MAX_DISPLAY_LENGTH else "")
+            print(f"📥 已复制文本: \"{display_text}\"")
         except Exception as e:
             print(f"❌ 处理文本消息时出错: {e}")
             traceback.print_exc()
-        # finally: # Moved finally block to receive_clipboard_changes
-        #     self.is_receiving = False
 
 
-    def _set_windows_clipboard_file(self, file_path: Path) -> bool:
-         """Sets a file path to the Windows clipboard using CF_HDROP."""
-         try:
-              path_str = str(file_path.resolve()) # Use resolved absolute path
-              files = path_str + '\0' # Needs double null termination for list
-              file_bytes = files.encode('utf-16le') + b'\0\0'
-
-              # Create DROPFILES structure
-              df = DROPFILES()
-              df.pFiles = sizeof(df) # Offset to the path list
-              df.pt[0] = df.pt[1] = 0 # Drop point (not relevant here)
-              df.fNC = 0
-              df.fWide = 1 # Using Unicode
-
-              # Combine structure and path data
-              data = bytes(df) + file_bytes
-
-              # Set to clipboard
-              win32clipboard.OpenClipboard()
-              try:
-                   win32clipboard.EmptyClipboard()
-                   win32clipboard.SetClipboardData(win32con.CF_HDROP, data)
-                   print(f"📎 已将文件添加到剪贴板: {file_path.name}")
-                   return True
-              finally:
-                   win32clipboard.CloseClipboard()
-
-         except Exception as e:
-              print(f"❌ 使用 CF_HDROP 设置剪贴板文件失败: {e}")
-              traceback.print_exc()
-
-              # --- Fallback using COM (if available) ---
-              if HAS_WIN32COM:
-                   print("ℹ️ 尝试使用 COM 备用方法设置剪贴板...")
-                   try:
-                        pythoncom.CoInitialize() # Ensure COM is initialized
-                        data_obj = pythoncom.OleGetClipboard()
-                        # This part is complex and might not be the correct way
-                        # to *set* CF_HDROP via COM easily.
-                        # Setting clipboard data via COM usually involves IDataObject.
-                        # For simplicity, we'll fall back to text path.
-                        print("⚠️ COM 备用方法设置 CF_HDROP 较复杂，将回退到文本路径。")
-                        # Fall through to text fallback
-                   except Exception as com_err:
-                        print(f"❌ COM 备用方法失败: {com_err}")
-                        # Fall through to text fallback
-                   finally:
-                        # pythoncom.CoUninitialize() # Careful with uninit if used elsewhere
-
-                # --- Final Fallback: Set as text ---
-                    try:
-                        pyperclip.copy(path_str)
-                        print(f"📎 已将文件路径作为文本复制到剪贴板: {file_path.name}")
-                        # Return True even for text fallback, as *something* was set
-                        return True
-                    except Exception as text_err:
-                        print(f"❌ 将文件路径作为文本复制也失败了: {text_err}")
-                        return False # All methods failed
-
-         return False # Should not be reached unless initial try fails weirdly
-
-
-    async def _handle_file_response(self, message):
+    async def _handle_file_response(self, message, send_encrypted_wrapper):
         """处理接收到的文件响应 (块)"""
         try:
             # Use FileHandler to process the chunk
-            is_complete, completed_path = self.file_handler.handle_received_chunk(message)
+            is_complete, completed_path = await self.file_handler.handle_received_chunk(
+                message,
+                send_encrypted_wrapper
+            )
 
             # If file transfer is complete
             if is_complete and completed_path:
@@ -885,8 +950,7 @@ class WindowsClipboardClient:
                     print("⏭️ 跳过重复文件内容 (与本地最后发送/设置一致)")
                     return # Don't update clipboard
 
-                # Set the completed file to the Windows clipboard
-                if self._set_windows_clipboard_file(completed_path):
+                if ClipboardUtils.set_clipboard_file(completed_path):
                      # Update state *after* successful clipboard operation
                      self.last_content_hash = content_hash # Mark this hash as processed locally
                      self.last_update_time = time.time() # Mark time of local update
@@ -901,11 +965,6 @@ class WindowsClipboardClient:
         except Exception as e:
             print(f"❌ 处理文件响应时出错: {e}")
             traceback.print_exc()
-        # finally: # Moved finally block to receive_clipboard_changes
-        #     self.is_receiving = False
-
-    # Removed handle_file_transfer (now uses FileHandler's method via wrapper)
-    # Removed get_files_content_hash (moved to FileHandler)
 
 
 async def main(): # Make main async
@@ -920,20 +979,22 @@ async def main(): # Make main async
         # Create status task within the running loop
         status_task = asyncio.create_task(client.show_connection_status())
         try:
-            await client.sync_clipboard() # Run main sync loop
+            client.server_task = asyncio.create_task(client.start_server())
+            client.clipboard_task = asyncio.create_task(client.send_clipboard_changes())
+            sync_task = asyncio.create_task(client.sync_clipboard())
+            await asyncio.gather(client.server_task, client.clipboard_task, sync_task)
         finally:
             # Ensure status task is cancelled if sync_clipboard finishes/errors
             if status_task and not status_task.done():
                 status_task.cancel()
 
     try:
-        print("🚀 UniPaste Windows 客户端已启动")
+        print("🚀 UniPaste Windows 节点已启动")
         print(f"📂 临时文件目录: {client.file_handler.temp_dir}")
         print("📋 按 Ctrl+C 退出程序")
 
-        # Run the client logic directly
         main_task = asyncio.create_task(run_client())
-        await main_task # Wait for the main client task to complete
+        await main_task
 
     except KeyboardInterrupt:
         print("\n👋 检测到 Ctrl+C，正在关闭...")
@@ -944,7 +1005,6 @@ async def main(): # Make main async
         traceback.print_exc()
     finally:
         print("⏳ 正在清理资源...")
-        # Initiate stop sequence (ensure client.stop() is called)
         client.stop()
 
         # Cancel tasks if they are still running (main_task should be done or cancelled)
@@ -959,13 +1019,9 @@ async def main(): # Make main async
 
 
 if __name__ == "__main__":
-    # Set event loop policy for Windows if needed (usually not required for basic asyncio)
-    # if sys.platform == 'win32':
-    #     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     try:
-        asyncio.run(main()) # Use asyncio.run()
+        asyncio.run(main())
     except RuntimeError as e:
-         # Catch potential loop-related errors during shutdown
          if "Event loop is closed" in str(e):
               print("ℹ️ Event loop closed.")
          else:

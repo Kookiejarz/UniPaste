@@ -2,11 +2,20 @@
 .DS_Store
 **/.DS_Store
 
-# Python cache files
+# Python bytecode and cache files
 __pycache__/
 **/__pycache__/
 *.py[cod]
+*.pyc.*
+*.pyo
 *$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.pytype/
+.hypothesis/
+
 
 # App specific files
 .dstore/

@@ -1,5 +1,4 @@
 import socket
-import json
 from zeroconf import ServiceBrowser, Zeroconf, ServiceInfo, ServiceListener
 import netifaces
 import asyncio
@@ -14,7 +13,22 @@ class ClipboardServiceListener(ServiceListener):
         if info:
             address = str(info.parsed_addresses()[0])
             port = info.port
-            self.callback(f"ws://{address}:{port}")
+            properties = {}
+            if info.properties:
+                for key, value in info.properties.items():
+                    decoded_key = key.decode("utf-8") if isinstance(key, bytes) else str(key)
+                    if isinstance(value, bytes):
+                        properties[decoded_key] = value.decode("utf-8")
+                    else:
+                        properties[decoded_key] = str(value)
+
+            self.callback({
+                "url": f"ws://{address}:{port}",
+                "address": address,
+                "port": port,
+                "name": name,
+                "properties": properties,
+            })
             
     # Required methods for ServiceListener
     def remove_service(self, zeroconf, type_, name):
@@ -31,21 +45,26 @@ class DeviceDiscovery:
         self._executor = ThreadPoolExecutor(max_workers=1)
         self.browser = None # Initialize browser attribute
 
-    async def start_advertising(self, port):
+    async def start_advertising(self, port, device_id=None, platform=None):
         """Advertise this device on the network."""
         ip_addr = self._get_local_ip()
         print(f"🌐 使用IP地址 {ip_addr} 和端口 {port} 注册服务")
+        properties = {}
+        if device_id:
+            properties["device_id"] = device_id
+        if platform:
+            properties["platform"] = platform
         
         info = ServiceInfo(
             self.service_name,
-            f"Device_{socket.gethostname()}.{self.service_name}",
+            f"Device_{device_id or socket.gethostname()}.{self.service_name}",
             addresses=[socket.inet_aton(ip_addr)],
             port=port,
-            properties={},
+            properties=properties,
         )
         
         print(f"📢 广播服务: {self.service_name}")
-        print(f"📛 服务名称: Device_{socket.gethostname()}.{self.service_name}")
+        print(f"📛 服务名称: Device_{device_id or socket.gethostname()}.{self.service_name}")
         
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(self._executor, self.zeroconf.register_service, info)

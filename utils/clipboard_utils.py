@@ -2,6 +2,7 @@
 import hashlib
 import time
 from pathlib import Path
+
 from utils.platform_config import IS_WINDOWS, IS_MACOS
 from config import ClipboardConfig
 
@@ -10,6 +11,14 @@ if IS_WINDOWS:
     import win32con
     from ctypes import Structure, c_uint, sizeof
     import pyperclip
+
+    class _DropFiles(Structure):
+        _fields_ = [
+            ("pFiles", c_uint),
+            ("pt", c_uint * 2),
+            ("fNC", c_uint),
+            ("fWide", c_uint),
+        ]
 elif IS_MACOS:
     import AppKit
 
@@ -39,6 +48,40 @@ class ClipboardUtils:
     # Windows specific methods
     if IS_WINDOWS:
         @staticmethod
+        def get_clipboard_text():
+            """获取Windows剪贴板中的Unicode文本"""
+            try:
+                win32clipboard.OpenClipboard()
+                try:
+                    if win32clipboard.IsClipboardFormatAvailable(win32con.CF_UNICODETEXT):
+                        data = win32clipboard.GetClipboardData(win32con.CF_UNICODETEXT)
+                        return data if isinstance(data, str) and data else None
+                finally:
+                    win32clipboard.CloseClipboard()
+            except Exception as e:
+                if "OpenClipboard" in str(e):
+                    print(f"⚠️ 无法访问剪贴板文本: {e} (可能被其他应用占用)")
+                    time.sleep(0.2)
+                else:
+                    print(f"❌ 读取剪贴板文本失败: {e}")
+            return None
+
+        @staticmethod
+        def set_clipboard_text(text: str) -> bool:
+            """使用原生 Win32 API 设置Unicode文本剪贴板"""
+            try:
+                win32clipboard.OpenClipboard()
+                try:
+                    win32clipboard.EmptyClipboard()
+                    win32clipboard.SetClipboardData(win32con.CF_UNICODETEXT, text)
+                    return True
+                finally:
+                    win32clipboard.CloseClipboard()
+            except Exception as e:
+                print(f"❌ 设置Windows文本剪贴板失败: {e}")
+                return False
+
+        @staticmethod
         def get_clipboard_files():
             """获取Windows剪贴板中的文件列表"""
             try:
@@ -62,13 +105,11 @@ class ClipboardUtils:
         @staticmethod 
         def set_clipboard_file(file_path: Path) -> bool:
             """设置Windows剪贴板文件"""
-            from windows_client import DROPFILES, HAS_WIN32COM
             try:
                 path_str = str(file_path.resolve())
-                files = path_str + '\0'
-                file_bytes = files.encode('utf-16le') + b'\0\0'
+                file_bytes = (path_str + "\0").encode("utf-16le") + b"\0\0"
 
-                df = DROPFILES()
+                df = _DropFiles()
                 df.pFiles = sizeof(df)
                 df.pt[0] = df.pt[1] = 0
                 df.fNC = 0
@@ -87,12 +128,12 @@ class ClipboardUtils:
 
             except Exception as e:
                 print(f"❌ 使用 CF_HDROP 设置剪贴板文件失败: {e}")
-                # Fallback to text
                 try:
                     pyperclip.copy(str(file_path))
                     print(f"📎 已将文件路径作为文本复制到剪贴板: {file_path.name}")
                     return True
-                except Exception:
+                except Exception as text_err:
+                    print(f"❌ 将文件路径作为文本复制也失败了: {text_err}")
                     return False
             return False
 
