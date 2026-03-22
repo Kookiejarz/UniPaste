@@ -60,7 +60,8 @@ jobs:
         if: matrix.platform == 'macos'
         shell: bash
         run: |
-          cat > unipaste.spec <<'PYI'
+          app_version="${GITHUB_REF_NAME#v}"
+          cat > unipaste.spec <<PYI
           # -*- mode: python -*-
           block_cipher = None
 
@@ -119,14 +120,33 @@ jobs:
               runtime_tmpdir=None,
               console=False,
               disable_windowed_traceback=False,
-              argv_emulation=True,
+              argv_emulation=False,
               target_arch=None,
               codesign_identity=None,
               entitlements_file=None,
           )
+          app = BUNDLE(
+              exe,
+              name='UniPaste-Mac.app',
+              bundle_identifier='com.kookiejarz.unipaste',
+              info_plist={
+                  'CFBundleName': 'UniPaste',
+                  'CFBundleDisplayName': 'UniPaste',
+                  'CFBundleShortVersionString': '${app_version}',
+                  'CFBundleVersion': '${GITHUB_RUN_NUMBER}',
+                  'LSUIElement': True,
+                  'NSLocalNetworkUsageDescription': 'UniPaste needs local network access to discover and connect to nearby devices.',
+                  'NSBonjourServices': ['_clipshare._tcp'],
+              },
+          )
           PYI
 
           pyinstaller unipaste.spec
+
+      - name: Ad-hoc sign macOS application
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: codesign --force --deep --sign - "dist/${{ matrix.executable_name }}.app"
 
       - name: Build Windows application
         if: matrix.platform == 'windows'
@@ -171,28 +191,32 @@ jobs:
         if: matrix.platform == 'macos'
         shell: bash
         run: |
-          release_dir="release/${{ matrix.release_dir }}"
-          mkdir -p "$release_dir"
-          cp "dist/${{ matrix.executable_name }}" "$release_dir/"
-          cp README.md "$release_dir/" || echo "README.md not found"
-          cp LICENSE "$release_dir/" || echo "LICENSE not found"
-          chmod +x "$release_dir/${{ matrix.executable_name }}"
+          package_root="package/${{ matrix.artifact_name }}"
+          archive_path="release/${{ matrix.artifact_name }}.zip"
+          mkdir -p "$package_root" release
+          cp -R "dist/${{ matrix.executable_name }}.app" "$package_root/"
+          cp README.md "$package_root/" || echo "README.md not found"
+          cp LICENSE "$package_root/" || echo "LICENSE not found"
+          ditto -c -k --sequesterRsrc --keepParent "$package_root" "$archive_path"
 
       - name: Package Windows artifact
         if: matrix.platform == 'windows'
         shell: pwsh
         run: |
-          $releaseDir = "release/${{ matrix.release_dir }}"
-          New-Item -ItemType Directory -Force -Path $releaseDir | Out-Null
-          Copy-Item "dist/${{ matrix.executable_name }}.exe" "$releaseDir/"
-          if (Test-Path README.md) { Copy-Item README.md "$releaseDir/" } else { Write-Host "README.md not found" }
-          if (Test-Path LICENSE) { Copy-Item LICENSE "$releaseDir/" } else { Write-Host "LICENSE not found" }
+          $packageRoot = "package/${{ matrix.artifact_name }}"
+          $archivePath = "release/${{ matrix.artifact_name }}.zip"
+          New-Item -ItemType Directory -Force -Path $packageRoot | Out-Null
+          New-Item -ItemType Directory -Force -Path release | Out-Null
+          Copy-Item "dist/${{ matrix.executable_name }}.exe" "$packageRoot/"
+          if (Test-Path README.md) { Copy-Item README.md "$packageRoot/" } else { Write-Host "README.md not found" }
+          if (Test-Path LICENSE) { Copy-Item LICENSE "$packageRoot/" } else { Write-Host "LICENSE not found" }
+          Compress-Archive -Path "$packageRoot/*" -DestinationPath $archivePath -Force
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact_name }}
-          path: release/${{ matrix.release_dir }}/
+          path: release/${{ matrix.artifact_name }}.zip
 
   create-release:
     needs: build
@@ -202,15 +226,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: release
-
-      - name: Create ZIP archives
-        shell: bash
-        run: |
-          cd release
-          for dir in */; do
-            name="${dir%/}"
-            zip -r "${name}.zip" "$name"
-          done
+          merge-multiple: true
 
       - name: Create Release
         uses: softprops/action-gh-release@v1

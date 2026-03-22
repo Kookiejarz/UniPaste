@@ -29,6 +29,13 @@ from utils.service_host import ServiceHost
 from utils.control_panel import ControlPanel
 from utils.autostart import MacLaunchAgentManager
 
+def _resource_path(*parts: str) -> str:
+    if getattr(sys, "frozen", False):
+        base_dir = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    else:
+        base_dir = Path(__file__).resolve().parent
+    return str(base_dir.joinpath(*parts))
+
 class ClipboardListener:
     """剪贴板监听和同步节点"""
 
@@ -1172,9 +1179,9 @@ def run_headless():
 class MacTrayApp(rumps.App):
     def __init__(self, host, open_panel_callback):
         # Use the template icon for macOS status bar
-        icon_path = os.path.join("assets", "unipaste_mac_template.png")
+        icon_path = _resource_path("assets", "unipaste_mac_template.png")
         if not os.path.exists(icon_path):
-             icon_path = os.path.join("assets", "unipaste.png")
+             icon_path = _resource_path("assets", "unipaste.png")
         if not os.path.exists(icon_path):
              icon_path = None
         super(MacTrayApp, self).__init__("UniPaste", icon=icon_path, quit_button=None)
@@ -1345,11 +1352,6 @@ if __name__ == '__main__':
                 if arg == '-c' and i + 1 < len(sys.argv):
                     exec(sys.argv[i+1])
                     sys.exit()
-            
-            if any('--multiprocessing-fork' in arg for arg in sys.argv):
-                from multiprocessing.spawn import spawn_main
-                spawn_main()
-                sys.exit()
 
     multiprocessing.freeze_support()
     try:
