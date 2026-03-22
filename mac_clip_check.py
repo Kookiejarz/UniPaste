@@ -1245,13 +1245,6 @@ def run_panel_process(shared_dict, cmd_queue):
 
 
 def run_control_panel():
-    # Use Multiprocessing for Mac UI to avoid thread conflicts
-    # We must use 'spawn' to be safe on Mac with UI frameworks
-    try:
-        multiprocessing.set_start_method('spawn', force=True)
-    except RuntimeError:
-        pass
-    
     with Manager() as manager:
         shared_dict = manager.dict()
         cmd_queue = Queue()
@@ -1330,10 +1323,37 @@ def parse_args():
     parser.add_argument("--install-launch-agent", action="store_true", help="安装开机自启动 LaunchAgent")
     parser.add_argument("--remove-launch-agent", action="store_true", help="移除开机自启动 LaunchAgent")
     parser.add_argument("--launch-agent-status", action="store_true", help="查看 LaunchAgent 状态")
-    return parser.parse_args()
+    args, unknown = parser.parse_known_args()
+    return args
 
 
 if __name__ == '__main__':
+    if getattr(sys, 'frozen', False):
+        multiprocessing.set_executable(sys.executable)
+    # Fix for multiprocessing with spawn on frozen macOS apps
+    if getattr(sys, 'frozen', False) and sys.platform == 'darwin':
+        if len(sys.argv) > 1:
+            if sys.argv[1] == '-c' and len(sys.argv) > 2:
+                # Handle resource tracker and other -c commands
+                exec(sys.argv[2])
+                sys.exit()
+            # If the command starts with Python flags like -B -S -I -c
+            # (common when multiprocessing spawns a process in a frozen app)
+            for i, arg in enumerate(sys.argv):
+                if arg == '-c' and i + 1 < len(sys.argv):
+                    exec(sys.argv[i+1])
+                    sys.exit()
+            
+            if any('--multiprocessing-fork' in arg for arg in sys.argv):
+                from multiprocessing.spawn import spawn_main
+                spawn_main()
+                sys.exit()
+
+    multiprocessing.freeze_support()
+    try:
+        multiprocessing.set_start_method('spawn', force=True)
+    except RuntimeError:
+        pass
     args = parse_args()
     launch_agent_manager = MacLaunchAgentManager(script_path=Path(__file__).resolve())
 
