@@ -9,6 +9,7 @@ from config import ClipboardConfig
 if IS_WINDOWS:
     import win32clipboard
     import win32con
+    import ctypes
     from ctypes import Structure, c_uint, sizeof
     import pyperclip
 
@@ -47,6 +48,15 @@ class ClipboardUtils:
 
     # Windows specific methods
     if IS_WINDOWS:
+        @staticmethod
+        def get_clipboard_change_count():
+            """获取Windows剪贴板序列号。"""
+            try:
+                return ctypes.windll.user32.GetClipboardSequenceNumber()
+            except Exception as e:
+                print(f"⚠️ 获取Windows剪贴板序列号失败: {e}")
+                return None
+
         @staticmethod
         def get_clipboard_text():
             """获取Windows剪贴板中的Unicode文本"""
@@ -139,6 +149,15 @@ class ClipboardUtils:
 
     # macOS specific methods  
     elif IS_MACOS:
+        @staticmethod
+        def get_clipboard_change_count():
+            """获取macOS剪贴板变化计数。"""
+            try:
+                return AppKit.NSPasteboard.generalPasteboard().changeCount()
+            except Exception as e:
+                print(f"⚠️ 获取Mac剪贴板变化计数失败: {e}")
+                return None
+
         @staticmethod
         def get_clipboard_files():
             """获取macOS剪贴板中的文件列表"""

@@ -11,6 +11,7 @@ import traceback
 
 import websockets
 
+from utils.clipboard_loop_guard import ClipboardLoopGuard
 from utils.security.crypto import SecurityManager
 from utils.security.auth import DeviceAuthManager
 from utils.network.discovery import DeviceDiscovery
@@ -65,6 +66,8 @@ class WindowsClipboardClient:
         self.connection_security = {}
         self.discovered_peers = {}
         self.peer_platforms = {}
+        self.peer_retry_state = {}
+        self.loop_guard = ClipboardLoopGuard()
         self.server_task = None
         self.clipboard_task = None
 
@@ -223,6 +226,101 @@ class WindowsClipboardClient:
             manager.generate_key_pair()
             self.connection_security[websocket] = manager
         return manager
+
+    def _build_clipboard_snapshot(self):
+        file_paths = ClipboardUtils.get_clipboard_files()
+        if file_paths:
+            return {
+                "kind": "files",
+                "fingerprint": self.file_handler.get_files_content_hash(file_paths),
+                "text": None,
+            }
+
+        text = ClipboardUtils.get_clipboard_text()
+        if text:
+            return {
+                "kind": "text",
+                "fingerprint": hashlib.md5(text.encode()).hexdigest(),
+                "text": text,
+            }
+        return None
+
+    def _consume_expected_clipboard_echo(self) -> bool:
+        snapshot = self._build_clipboard_snapshot()
+        if not snapshot:
+            return False
+
+        event = self.loop_guard.consume_if_expected(
+            kind=snapshot["kind"],
+            fingerprint=snapshot["fingerprint"],
+            change_count=ClipboardUtils.get_clipboard_change_count(),
+        )
+        if not event:
+            return False
+
+        now = time.time()
+        self.last_content_hash = snapshot["fingerprint"]
+        self.last_update_time = now
+        self.last_remote_content_hash = snapshot["fingerprint"]
+        self.last_remote_update_time = now
+        if snapshot["kind"] == "text":
+            self._last_processed_content = snapshot["text"]
+        print(f"⏭️ 已消费远端{event.kind}剪贴板回显，不再回传")
+        return True
+
+    def _register_applied_remote_event(self, message: dict, kind: str, fingerprint: str | None):
+        self.loop_guard.register(
+            kind=kind,
+            fingerprint=fingerprint,
+            expected_change_count=ClipboardUtils.get_clipboard_change_count(),
+            event_id=message.get("event_id"),
+            origin_device_id=message.get("origin_device_id"),
+        )
+
+    def _get_peer_retry_state(self, peer_id):
+        return self.peer_retry_state.setdefault(
+            peer_id,
+            {"failures": 0, "next_retry_at": 0.0},
+        )
+
+    def _reset_peer_retry(self, peer_id):
+        if peer_id:
+            self.peer_retry_state.pop(peer_id, None)
+
+    def _mark_peer_failure(self, peer_id, error=None):
+        if not peer_id:
+            return
+
+        state = self._get_peer_retry_state(peer_id)
+        state["failures"] += 1
+        delay = min(
+            ClipboardConfig.PEER_RETRY_BASE_DELAY * (2 ** (state["failures"] - 1)),
+            ClipboardConfig.PEER_RETRY_MAX_DELAY,
+        )
+        state["next_retry_at"] = time.time() + delay
+
+        if error:
+            print(f"⏳ 设备 {peer_id} 进入冷却 {delay:.0f} 秒: {error}")
+        else:
+            print(f"⏳ 设备 {peer_id} 进入冷却 {delay:.0f} 秒")
+
+    @staticmethod
+    def _is_expected_peer_unavailable_error(error) -> bool:
+        if isinstance(error, (asyncio.TimeoutError, TimeoutError)):
+            return True
+        if isinstance(error, websockets.exceptions.ConnectionClosed):
+            return getattr(error, "code", None) in {1000, 1001}
+
+        message = str(error).lower()
+        expected_markers = (
+            "timed out during opening handshake",
+            "received 1000",
+            "received 1001",
+            "connection refused",
+            "connect call failed",
+            "server rejected websocket connection",
+        )
+        return any(marker in message for marker in expected_markers)
 
     async def broadcast_encrypted_data(self, data_to_encrypt: bytes, exclude_websocket=None):
         if not self.peer_connections:
@@ -410,13 +508,20 @@ class WindowsClipboardClient:
 
         while self.running:
             try:
+                now = time.time()
                 connected_peer_ids = set(self.peer_connections.keys())
                 candidate_peer_id = None
                 candidate_url = None
+                next_retry_at = None
                 for peer_id, peer_info in sorted(self.discovered_peers.items()):
                     if not self._should_initiate_connection(peer_id):
                         continue
                     if peer_id in connected_peer_ids:
+                        continue
+                    retry_state = self.peer_retry_state.get(peer_id)
+                    if retry_state and retry_state["next_retry_at"] > now:
+                        retry_at = retry_state["next_retry_at"]
+                        next_retry_at = retry_at if next_retry_at is None else min(next_retry_at, retry_at)
                         continue
                     candidate_peer_id = peer_id
                     candidate_url = peer_info.get("url")
@@ -429,12 +534,23 @@ class WindowsClipboardClient:
                     try:
                         await self.connect_and_sync(candidate_peer_id, candidate_url)
                     except Exception as e:
-                        print(f"❌ 与设备 {candidate_peer_id} 建立连接失败: {e}")
-                        traceback.print_exc()
-                        await self.wait_for_reconnect()
+                        if self._is_expected_peer_unavailable_error(e):
+                            print(f"ℹ️ 设备 {candidate_peer_id} 当前不可用，等待对端连接: {e}")
+                        else:
+                            print(f"❌ 与设备 {candidate_peer_id} 建立连接失败: {e}")
+                            traceback.print_exc()
+                        self._mark_peer_failure(candidate_peer_id, e)
+                        await asyncio.sleep(0.5)
                 else:
                     self._update_connection_status()
-                await asyncio.sleep(ClipboardConfig.CLIPBOARD_CHECK_INTERVAL)
+                    if next_retry_at is not None:
+                        sleep_for = max(
+                            ClipboardConfig.CLIPBOARD_CHECK_INTERVAL,
+                            min(next_retry_at - now, ClipboardConfig.PEER_RETRY_BASE_DELAY),
+                        )
+                    else:
+                        sleep_for = ClipboardConfig.CLIPBOARD_CHECK_INTERVAL
+                    await asyncio.sleep(sleep_for)
 
             except asyncio.CancelledError:
                 print("🛑 同步任务被取消")
@@ -444,33 +560,6 @@ class WindowsClipboardClient:
                 traceback.print_exc()
                 # Avoid tight loop on unexpected error
                 await asyncio.sleep(5)
-
-    async def wait_for_reconnect(self):
-        """等待重连，使用指数退避策略"""
-        current_time = time.time()
-        # Reset delay if discovery was recent
-        if current_time - self.last_discovery_time < 10:
-            self.reconnect_delay = 3 # Reset to base delay
-            delay = self.reconnect_delay
-        else:
-            # Exponential backoff
-            delay = min(self.reconnect_delay * 2, self.max_reconnect_delay)
-            self.reconnect_delay = delay
-
-        print(f"⏱️ {int(delay)}秒后重新尝试连接...")
-
-        # Wait in segments to allow faster exit
-        wait_start = time.time()
-        while self.running and time.time() - wait_start < delay:
-            await asyncio.sleep(0.5)
-
-        if self.running:
-             # Reset URL to force rediscovery if needed
-             self.ws_url = None
-             print("🔄 重新搜索剪贴板服务...")
-             # Explicitly restart discovery here (start_discovery now handles stopping previous browser)
-             self.discovery.start_discovery(self.on_service_found)
-
 
     async def connect_and_sync(self, peer_id, ws_url):
         """主动连接到对等设备并处理消息"""
@@ -485,19 +574,23 @@ class WindowsClipboardClient:
             # --- Authentication ---
             remote_peer_id = await self.authenticate(websocket)
             if not remote_peer_id:
+                self._mark_peer_failure(peer_id, "身份验证失败")
                 print("❌ 身份验证失败，断开连接")
                 return # Close connection
 
             # --- Key Exchange ---
             if not await self.perform_key_exchange_as_client(websocket):
+                self._mark_peer_failure(remote_peer_id, "密钥交换失败")
                 print("❌ 密钥交换失败，断开连接")
                 return # Close connection
 
             if not self._register_peer(remote_peer_id, websocket):
+                self._reset_peer_retry(remote_peer_id)
                 print(f"⚠️ 已存在与 {remote_peer_id} 的连接，关闭重复出站连接")
                 return
 
-            self.reconnect_delay = 3
+            self._reset_peer_retry(peer_id)
+            self._reset_peer_retry(remote_peer_id)
             self.connection_status = ConnectionStatus.CONNECTED
             self.last_content_hash = None
             print(f"✅ 已连接到设备 {remote_peer_id}，开始同步剪贴板")
@@ -606,6 +699,10 @@ class WindowsClipboardClient:
                 current_time = time.time()
 
                 if not self.peer_connections:
+                    await asyncio.sleep(ClipboardConfig.CLIPBOARD_CHECK_INTERVAL)
+                    continue
+
+                if self._consume_expected_clipboard_echo():
                     await asyncio.sleep(ClipboardConfig.CLIPBOARD_CHECK_INTERVAL)
                     continue
 
@@ -915,11 +1012,11 @@ class WindowsClipboardClient:
 
             self.last_content_hash = content_hash
             self.last_update_time = time.time()
-            self.ignore_clipboard_until = time.time() + ClipboardConfig.UPDATE_DELAY
             self._last_processed_content = text
 
             self.last_remote_content_hash = content_hash
             self.last_remote_update_time = time.time()
+            self._register_applied_remote_event(message, "text", content_hash)
 
             display_text = text[:ClipboardConfig.MAX_DISPLAY_LENGTH] + ("..." if len(text) > ClipboardConfig.MAX_DISPLAY_LENGTH else "")
             print(f"📥 已复制文本: \"{display_text}\"")
@@ -953,10 +1050,11 @@ class WindowsClipboardClient:
                      # Update state *after* successful clipboard operation
                      self.last_content_hash = content_hash # Mark this hash as processed locally
                      self.last_update_time = time.time() # Mark time of local update
-                     self.ignore_clipboard_until = time.time() + ClipboardConfig.UPDATE_DELAY * 1.5 # Longer ignore for files
                      # Record hash and time from remote sender for loop detection
                      self.last_remote_content_hash = content_hash
                      self.last_remote_update_time = time.time()
+                     self._register_applied_remote_event(message, "files", content_hash)
+                     print("🔄 文件已登记为远端事件回显，下一次变化不会回传")
                 else:
                      print(f"❌ 未能将文件 {completed_path.name} 设置到剪贴板")
 

@@ -25,6 +25,8 @@ class ClipboardConfig:
     PING_INTERVAL = 20
     PING_TIMEOUT = 20
     PAIRING_TIMEOUT_SECONDS = 60
+    PEER_RETRY_BASE_DELAY = 3.0
+    PEER_RETRY_MAX_DELAY = 30.0
 
     PLATFORM_SETTINGS = {
         "windows": {

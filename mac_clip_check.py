@@ -11,12 +11,14 @@ from utils.security.crypto import SecurityManager
 from utils.security.auth import DeviceAuthManager
 from utils.network.discovery import DeviceDiscovery
 from utils.message_format import ClipMessage, MessageType
+from utils.clipboard_loop_guard import ClipboardLoopGuard
 from pathlib import Path
 import hashlib
 from handlers.file_handler import FileHandler
 from config import ClipboardConfig
 from utils.security.pairing import PairingManager, PairingStatus
 import threading
+from utils.clipboard_utils import ClipboardUtils
 
 class ClipboardListener:
     """剪贴板监听和同步节点"""
@@ -39,6 +41,8 @@ class ClipboardListener:
         self.peer_connections = {}
         self.websocket_peer_ids = {}
         self.connection_security = {}
+        self.peer_retry_state = {}
+        self.loop_guard = ClipboardLoopGuard()
 
     def _init_basic_components(self):
         """初始化基础组件"""
@@ -60,6 +64,78 @@ class ClipboardListener:
         self.last_update_time = 0 # Timestamp of the last clipboard update *initiated by this instance*
         self.running = True
         self.server = None
+
+    def _build_clipboard_snapshot(self):
+        file_paths = ClipboardUtils.get_clipboard_files()
+        if file_paths:
+            return {
+                "kind": "files",
+                "fingerprint": self.file_handler.get_files_content_hash(file_paths),
+            }
+
+        text = self.pasteboard.stringForType_(AppKit.NSPasteboardTypeString)
+        if text:
+            return {
+                "kind": "text",
+                "fingerprint": hashlib.md5(text.encode()).hexdigest(),
+            }
+        return None
+
+    def _consume_expected_clipboard_echo(self, change_count: int) -> bool:
+        snapshot = self._build_clipboard_snapshot()
+        if not snapshot:
+            return False
+
+        event = self.loop_guard.consume_if_expected(
+            kind=snapshot["kind"],
+            fingerprint=snapshot["fingerprint"],
+            change_count=change_count,
+        )
+        if not event:
+            return False
+
+        now = time.time()
+        self.last_change_count = change_count
+        self.last_content_hash = snapshot["fingerprint"]
+        self.last_update_time = now
+        self.last_remote_content_hash = snapshot["fingerprint"]
+        self.last_remote_update_time = now
+        print(f"⏭️ 已消费远端{event.kind}剪贴板回显，不再回传")
+        return True
+
+    def _register_applied_remote_event(self, message: dict, kind: str, fingerprint: str | None, change_count: int | None):
+        self.loop_guard.register(
+            kind=kind,
+            fingerprint=fingerprint,
+            expected_change_count=change_count,
+            event_id=message.get("event_id"),
+            origin_device_id=message.get("origin_device_id"),
+        )
+
+    async def _apply_received_file_to_clipboard(self, message: dict, completed_path: Path):
+        print(f"✅ 文件接收完成: {completed_path}")
+
+        content_hash = self.file_handler.get_files_content_hash([str(completed_path)])
+        if content_hash and content_hash == self.last_content_hash:
+            print("⏭️ 跳过重复文件内容 (与本地最后发送/设置一致)")
+            return
+
+        await asyncio.sleep(0.1)
+        change_count = await self.file_handler.set_clipboard_file(completed_path)
+        if change_count is None:
+            print(f"❌ 将文件 {completed_path.name} 设置到剪贴板失败")
+            return
+
+        now = time.time()
+        self.last_change_count = change_count
+        self.last_content_hash = content_hash
+        self.last_update_time = now
+        self.last_remote_content_hash = content_hash
+        self.last_remote_update_time = now
+        self._register_applied_remote_event(message, "files", content_hash, change_count)
+
+        print("✅ 文件已设置到剪贴板并可用于粘贴")
+        print("🔄 文件已登记为远端事件回显，下一次变化不会回传")
 
     def _init_file_handling(self):
         """初始化文件处理相关"""
@@ -161,6 +237,51 @@ class ClipboardListener:
             manager.generate_key_pair()
             self.connection_security[websocket] = manager
         return manager
+
+    def _get_peer_retry_state(self, peer_id):
+        return self.peer_retry_state.setdefault(
+            peer_id,
+            {"failures": 0, "next_retry_at": 0.0},
+        )
+
+    def _reset_peer_retry(self, peer_id):
+        if peer_id:
+            self.peer_retry_state.pop(peer_id, None)
+
+    def _mark_peer_failure(self, peer_id, error=None):
+        if not peer_id:
+            return
+
+        state = self._get_peer_retry_state(peer_id)
+        state["failures"] += 1
+        delay = min(
+            ClipboardConfig.PEER_RETRY_BASE_DELAY * (2 ** (state["failures"] - 1)),
+            ClipboardConfig.PEER_RETRY_MAX_DELAY,
+        )
+        state["next_retry_at"] = time.time() + delay
+
+        if error:
+            print(f"⏳ 设备 {peer_id} 进入冷却 {delay:.0f} 秒: {error}")
+        else:
+            print(f"⏳ 设备 {peer_id} 进入冷却 {delay:.0f} 秒")
+
+    @staticmethod
+    def _is_expected_peer_unavailable_error(error) -> bool:
+        if isinstance(error, (asyncio.TimeoutError, TimeoutError)):
+            return True
+        if isinstance(error, websockets.exceptions.ConnectionClosed):
+            return getattr(error, "code", None) in {1000, 1001}
+
+        message = str(error).lower()
+        expected_markers = (
+            "timed out during opening handshake",
+            "received 1000",
+            "received 1001",
+            "connection refused",
+            "connect call failed",
+            "server rejected websocket connection",
+        )
+        return any(marker in message for marker in expected_markers)
 
     def _on_pairing_request(self, request):
         """Handle pairing request - show notification to user"""
@@ -429,12 +550,13 @@ class ClipboardListener:
 
                 if success:
                     now = time.time()
-                    self.last_change_count = self.pasteboard.changeCount()
+                    change_count = self.pasteboard.changeCount()
+                    self.last_change_count = change_count
                     self.last_content_hash = content_hash
                     self.last_update_time = now
-                    self.ignore_clipboard_until = now + ClipboardConfig.UPDATE_DELAY
                     self.last_remote_content_hash = content_hash
                     self.last_remote_update_time = now
+                    self._register_applied_remote_event(message, "text", content_hash, change_count)
 
                     display_text = text[:ClipboardConfig.MAX_DISPLAY_LENGTH] + ("..." if len(text) > ClipboardConfig.MAX_DISPLAY_LENGTH else "")
                     print(f"📥 已复制文本: \"{display_text}\"")
@@ -453,42 +575,12 @@ class ClipboardListener:
                 await self.file_handler.handle_transfer_start(message)
 
             elif msg_type == MessageType.FILE_RESPONSE:
-                # Handle incoming file chunk
                 is_complete, completed_path = await self.file_handler.handle_received_chunk(
                     message,
                     lambda data: self._send_encrypted(data, sender_websocket)
                 )
                 if is_complete and completed_path:
-                    print(f"✅ 文件接收完成: {completed_path}")
-
-                    content_hash = self.file_handler.get_files_content_hash([str(completed_path)])
-
-                    if content_hash and content_hash == self.last_content_hash:
-                         print("⏭️ 跳过重复文件内容 (与本地最后发送/设置一致)")
-                         return
-
-                    file_to_set = completed_path
-                    content_hash_to_use = content_hash
-                    
-                    await asyncio.sleep(0.1)
-                    change_count = await self.file_handler.set_clipboard_file(file_to_set)
-                    if change_count is not None:
-                        self.last_change_count = change_count
-
-                        self.last_content_hash = content_hash_to_use
-                        self.last_update_time = time.time()
-
-                        self.ignore_clipboard_until = time.time() + 10.0
-                        self.last_remote_content_hash = content_hash_to_use
-                        self.last_remote_update_time = time.time()
-
-                        print("✅ 文件已设置到剪贴板并可用于粘贴")
-                        print("🔄 文件已标记为已处理，防止重复广播")
-                        print("⏳ 暂停监控10秒以确保文件可访问")
-                        print("💡 在接下来10秒内，您可以自由粘贴文件而不受监控干扰")
-
-                    else:
-                         print(f"❌ 将文件 {completed_path.name} 设置到剪贴板失败")
+                    await self._apply_received_file_to_clipboard(message, completed_path)
 
             elif msg_type == MessageType.FILE_CHUNK:
                 is_complete, completed_path = await self.file_handler.handle_received_chunk(
@@ -496,36 +588,7 @@ class ClipboardListener:
                     lambda data: self._send_encrypted(data, sender_websocket)
                 )
                 if is_complete and completed_path:
-                    print(f"✅ 文件接收完成: {completed_path}")
-
-                    content_hash = self.file_handler.get_files_content_hash([str(completed_path)])
-
-                    if content_hash and content_hash == self.last_content_hash:
-                         print("⏭️ 跳过重复文件内容 (与本地最后发送/设置一致)")
-                         return
-
-                    file_to_set = completed_path
-                    content_hash_to_use = content_hash
-                    
-                    await asyncio.sleep(0.1)
-                    change_count = await self.file_handler.set_clipboard_file(file_to_set)
-                    if change_count is not None:
-                        self.last_change_count = change_count
-
-                        self.last_content_hash = content_hash_to_use
-                        self.last_update_time = time.time()
-
-                        self.ignore_clipboard_until = time.time() + 10.0
-                        self.last_remote_content_hash = content_hash_to_use
-                        self.last_remote_update_time = time.time()
-
-                        print("✅ 文件已设置到剪贴板并可用于粘贴")
-                        print("🔄 文件已标记为已处理，防止重复广播")
-                        print("⏳ 暂停监控10秒以确保文件可访问")
-                        print("💡 在接下来10秒内，您可以自由粘贴文件而不受监控干扰")
-
-                    else:
-                         print(f"❌ 将文件 {completed_path.name} 设置到剪贴板失败")
+                    await self._apply_received_file_to_clipboard(message, completed_path)
 
             elif msg_type == MessageType.FILE_REQUEST:
                  file_path_requested = message.get("path")
@@ -608,13 +671,20 @@ class ClipboardListener:
 
         while self.running:
             try:
+                now = time.time()
                 connected_peer_ids = set(self.peer_connections.keys())
                 candidate_peer_id = None
                 candidate_url = None
+                next_retry_at = None
                 for peer_id, peer_info in sorted(self.discovered_peers.items()):
                     if not self._should_initiate_connection(peer_id):
                         continue
                     if peer_id in connected_peer_ids:
+                        continue
+                    retry_state = self.peer_retry_state.get(peer_id)
+                    if retry_state and retry_state["next_retry_at"] > now:
+                        retry_at = retry_state["next_retry_at"]
+                        next_retry_at = retry_at if next_retry_at is None else min(next_retry_at, retry_at)
                         continue
                     candidate_peer_id = peer_id
                     candidate_url = peer_info.get("url")
@@ -623,19 +693,30 @@ class ClipboardListener:
                 if candidate_peer_id and candidate_url:
                     print(f"🔌 正在连接到设备 {candidate_peer_id}: {candidate_url}")
                     try:
-                        await self.connect_and_sync(candidate_url)
+                        await self.connect_and_sync(candidate_peer_id, candidate_url)
                     except Exception as e:
-                        print(f"❌ 与设备 {candidate_peer_id} 建立连接失败: {e}")
-                        await asyncio.sleep(2)
+                        if self._is_expected_peer_unavailable_error(e):
+                            print(f"ℹ️ 设备 {candidate_peer_id} 当前不可用，等待对端连接: {e}")
+                        else:
+                            print(f"❌ 与设备 {candidate_peer_id} 建立连接失败: {e}")
+                        self._mark_peer_failure(candidate_peer_id, e)
+                        await asyncio.sleep(0.5)
                 else:
-                    await asyncio.sleep(ClipboardConfig.CLIPBOARD_CHECK_INTERVAL)
+                    if next_retry_at is not None:
+                        sleep_for = max(
+                            ClipboardConfig.CLIPBOARD_CHECK_INTERVAL,
+                            min(next_retry_at - now, ClipboardConfig.PEER_RETRY_BASE_DELAY),
+                        )
+                    else:
+                        sleep_for = ClipboardConfig.CLIPBOARD_CHECK_INTERVAL
+                    await asyncio.sleep(sleep_for)
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 print(f"❌ 主同步循环出错: {e}")
                 await asyncio.sleep(2)
 
-    async def connect_and_sync(self, ws_url):
+    async def connect_and_sync(self, peer_id, ws_url):
         async with websockets.connect(
             ws_url,
             subprotocols=["binary"],
@@ -643,18 +724,23 @@ class ClipboardListener:
             ping_interval=ClipboardConfig.PING_INTERVAL,
             ping_timeout=ClipboardConfig.PING_TIMEOUT
         ) as websocket:
-            peer_id = await self.authenticate(websocket)
-            if not peer_id:
+            remote_peer_id = await self.authenticate(websocket)
+            if not remote_peer_id:
+                self._mark_peer_failure(peer_id, "身份验证失败")
                 return
 
             if not await self.perform_key_exchange_as_client(websocket):
+                self._mark_peer_failure(remote_peer_id, "密钥交换失败")
                 return
 
-            if not self._register_peer(peer_id, websocket):
-                print(f"⚠️ 已存在与 {peer_id} 的连接，关闭重复出站连接")
+            if not self._register_peer(remote_peer_id, websocket):
+                self._reset_peer_retry(remote_peer_id)
+                print(f"⚠️ 已存在与 {remote_peer_id} 的连接，关闭重复出站连接")
                 return
 
-            print(f"✅ 已连接到设备 {peer_id}，开始同步剪贴板")
+            self._reset_peer_retry(peer_id)
+            self._reset_peer_retry(remote_peer_id)
+            print(f"✅ 已连接到设备 {remote_peer_id}，开始同步剪贴板")
             await self.send_current_clipboard_to_peer(websocket)
             try:
                 while self.running:
@@ -777,7 +863,12 @@ class ClipboardListener:
                     print(f"📋 剪贴板变化 detected (Count: {self.last_change_count} -> {new_change_count})")
                     types = self.pasteboard.types()
                     print(f"🔍 剪贴板类型: {list(types)}")
-                    
+
+                    if self._consume_expected_clipboard_echo(new_change_count):
+                        last_processed_time = time.time()
+                        await asyncio.sleep(ClipboardConfig.CLIPBOARD_CHECK_INTERVAL)
+                        continue
+
                     self.last_change_count = new_change_count
                     processed = await self.process_clipboard()
                     if processed:
