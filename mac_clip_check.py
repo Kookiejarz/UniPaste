@@ -23,16 +23,17 @@ class ClipboardListener:
 
     def __init__(self):
         """初始化剪贴板监听器"""
+        self.platform_name = "macos"
         self._init_basic_components()
         self._init_state_flags()
         self._init_file_handling()
         self.device_id = self._get_device_id()
-        self.device_name = os.environ.get("HOSTNAME", "Mac设备")
+        self.device_name = ClipboardConfig.get_device_name(self.platform_name)
         self.device_token = self._load_device_token()
         self.last_remote_content_hash = None
         self.last_remote_update_time = 0
         self.ignore_clipboard_until = 0 # Timestamp until which local clipboard changes are ignored
-        self.pairing_mgr = PairingManager(timeout_seconds=60)
+        self.pairing_mgr = PairingManager(timeout_seconds=ClipboardConfig.PAIRING_TIMEOUT_SECONDS)
         self.pairing_mgr.set_pairing_callback(self._on_pairing_request)
         self.discovered_peers = {}
         self.peer_connections = {}
@@ -83,10 +84,7 @@ class ClipboardListener:
             return f"mac-{int(time.time())}"
 
     def _get_token_path(self):
-        home_dir = Path.home()
-        token_dir = home_dir / ".clipshare"
-        token_dir.mkdir(parents=True, exist_ok=True)
-        return token_dir / "device_token_mac.txt"
+        return ClipboardConfig.get_device_token_path(self.platform_name)
 
     def _load_device_token(self):
         token_path = self._get_token_path()
@@ -641,9 +639,9 @@ class ClipboardListener:
         async with websockets.connect(
             ws_url,
             subprotocols=["binary"],
-            max_size=10 * 1024 * 1024,
-            ping_interval=20,
-            ping_timeout=20
+            max_size=ClipboardConfig.WEBSOCKET_MAX_SIZE,
+            ping_interval=ClipboardConfig.PING_INTERVAL,
+            ping_timeout=ClipboardConfig.PING_TIMEOUT
         ) as websocket:
             peer_id = await self.authenticate(websocket)
             if not peer_id:
@@ -674,7 +672,7 @@ class ClipboardListener:
                 "signature": self._generate_signature(),
                 "first_time": self.device_token is None,
                 "device_name": self.device_name,
-                "platform": "macos"
+                "platform": self.platform_name
             }
 
             await websocket.send(json.dumps(auth_info))
@@ -707,13 +705,13 @@ class ClipboardListener:
                     ClipboardConfig.HOST,
                     port,
                     subprotocols=["binary"],
-                    ping_interval=20,
-                    ping_timeout=20
+                    ping_interval=ClipboardConfig.PING_INTERVAL,
+                    ping_timeout=ClipboardConfig.PING_TIMEOUT
                 )
                 await self.discovery.start_advertising(
                     port,
                     device_id=self.device_id,
-                    platform="macos"
+                    platform=self.platform_name
                 )
                 print(f"🌐 WebSocket 对等节点监听在 {ClipboardConfig.HOST}:{port}")
 

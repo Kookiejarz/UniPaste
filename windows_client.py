@@ -11,6 +11,7 @@ import traceback
 
 import websockets
 
+from utils.security.crypto import SecurityManager
 from utils.security.auth import DeviceAuthManager
 from utils.network.discovery import DeviceDiscovery
 from utils.message_format import ClipMessage, MessageType
@@ -35,14 +36,15 @@ class ConnectionStatus:
 
 class WindowsClipboardClient:
     def __init__(self):
+        self.platform_name = "windows"
         self.discovery = DeviceDiscovery()
         self.ws_url = None
         self.is_receiving = False
         self.device_id = self._get_device_id()
-        self.device_name = os.environ.get('COMPUTERNAME', 'Windows设备')
+        self.device_name = ClipboardConfig.get_device_name(self.platform_name)
         self.device_token = self._load_device_token()
         self.auth_mgr = DeviceAuthManager()
-        self.pairing_mgr = PairingManager(timeout_seconds=60)
+        self.pairing_mgr = PairingManager(timeout_seconds=ClipboardConfig.PAIRING_TIMEOUT_SECONDS)
         self.pairing_mgr.set_pairing_callback(self._on_pairing_request)
         self.running = True
         self.connection_status = ConnectionStatus.DISCONNECTED
@@ -88,10 +90,7 @@ class WindowsClipboardClient:
 
     def _get_token_path(self):
         """获取令牌存储路径"""
-        home_dir = Path.home()
-        token_dir = home_dir / ".clipshare"
-        token_dir.mkdir(parents=True, exist_ok=True)
-        return token_dir / "device_token.txt"
+        return ClipboardConfig.get_device_token_path(self.platform_name)
 
     def _load_device_token(self):
         """加载设备令牌"""
@@ -293,13 +292,13 @@ class WindowsClipboardClient:
                     ClipboardConfig.HOST,
                     port,
                     subprotocols=["binary"],
-                    ping_interval=20,
-                    ping_timeout=20
+                    ping_interval=ClipboardConfig.PING_INTERVAL,
+                    ping_timeout=ClipboardConfig.PING_TIMEOUT
                 )
                 await self.discovery.start_advertising(
                     port,
                     device_id=self.device_id,
-                    platform="windows"
+                    platform=self.platform_name
                 )
                 print(f"🌐 Windows 对等节点监听在 {ClipboardConfig.HOST}:{port}")
                 await stop_event.wait()
@@ -479,9 +478,9 @@ class WindowsClipboardClient:
         async with websockets.connect(
             ws_url,
             subprotocols=["binary"],
-            max_size= 10 * 1024 * 1024, # Allow larger messages (e.g., 10MB) for file chunks
-            ping_interval=20,
-            ping_timeout=20
+            max_size=ClipboardConfig.WEBSOCKET_MAX_SIZE,
+            ping_interval=ClipboardConfig.PING_INTERVAL,
+            ping_timeout=ClipboardConfig.PING_TIMEOUT
         ) as websocket:
             # --- Authentication ---
             remote_peer_id = await self.authenticate(websocket)
@@ -520,8 +519,8 @@ class WindowsClipboardClient:
                 'identity': self.device_id,
                 'signature': self._generate_signature(),
                 'first_time': is_first_time,
-                'device_name': os.environ.get('COMPUTERNAME', 'Windows设备'),
-                'platform': 'windows'
+                'device_name': self.device_name,
+                'platform': self.platform_name
             }
 
             if is_first_time:
