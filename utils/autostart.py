@@ -4,6 +4,63 @@ import subprocess
 import sys
 from pathlib import Path
 
+try:
+    import winreg
+except ImportError:
+    winreg = None
+
+
+class WindowsRegistryAutostartManager:
+    REG_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+    APP_NAME = "UniPaste"
+
+    def __init__(self, script_path=None):
+        self.script_path = Path(script_path or sys.argv[0]).resolve()
+
+    def _get_command(self):
+        if getattr(sys, "frozen", False):
+            # If compiled with PyInstaller
+            exe = Path(sys.executable).resolve()
+            return f'"{exe}" --headless'
+        else:
+            # If running as script
+            python_exe = Path(sys.executable).resolve()
+            return f'"{python_exe}" "{self.script_path}" --headless'
+
+    def is_enabled(self) -> bool:
+        if not winreg:
+            return False
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, self.REG_KEY, 0, winreg.KEY_READ) as key:
+                winreg.QueryValueEx(key, self.APP_NAME)
+                return True
+        except WindowsError:
+            return False
+
+    def install(self):
+        if not winreg:
+            return False, "当前平台不支持注册表操作"
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, self.REG_KEY, 0, winreg.KEY_WRITE) as key:
+                winreg.SetValueEx(key, self.APP_NAME, 0, winreg.REG_SZ, self._get_command())
+            return True, "已成功设置开机自动启动"
+        except Exception as e:
+            return False, f"设置开机自动启动失败: {e}"
+
+    def uninstall(self):
+        if not winreg:
+            return False, "当前平台不支持注册表操作"
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, self.REG_KEY, 0, winreg.KEY_WRITE) as key:
+                winreg.DeleteValue(key, self.APP_NAME)
+            return True, "已成功取消开机自动启动"
+        except WindowsError as e:
+            if e.winerror == 2:  # File not found (value doesn't exist)
+                return True, "开机自动启动原本就未设置"
+            return False, f"取消开机自动启动失败: {e}"
+        except Exception as e:
+            return False, f"取消开机自动启动失败: {e}"
+
 
 class MacLaunchAgentManager:
     LABEL = "com.unipaste.agent"
@@ -81,7 +138,8 @@ class MacLaunchAgentManager:
             "could not find specified service",
             "no such process",
             "service is disabled",
+            "boot-out failed: 5",
         )
-        if action == "bootout" and any(marker in stderr for marker in benign_markers):
+        if action == "bootout" and (any(marker in stderr for marker in benign_markers) or result.returncode == 5):
             return
         raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "launchctl failed")

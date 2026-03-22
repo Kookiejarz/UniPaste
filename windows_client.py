@@ -1138,9 +1138,11 @@ def run_tray_app():
     from utils.service_host import ServiceHost
     from utils.control_panel import ControlPanel
     from utils.windows_tray import WindowsTrayApp
+    from utils.autostart import WindowsRegistryAutostartManager
 
     client = WindowsClipboardClient()
-    host = ServiceHost(client, _run_service_thread)
+    autostart_manager = WindowsRegistryAutostartManager(script_path=Path(__file__).resolve())
+    host = ServiceHost(client, _run_service_thread, autostart_manager=autostart_manager)
 
     panel_state = {"thread": None, "panel": None}
 
