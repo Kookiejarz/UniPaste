@@ -505,6 +505,24 @@ class FileHandler:
         except Exception as e:
             print(f"❌ 保存文件缓存失败: {e}")
 
+    def cleanup(self):
+        """清理临时目录下的所有文件"""
+        print(f"🧹 正在清理临时文件目录: {self.temp_dir}")
+        try:
+            for item in self.temp_dir.iterdir():
+                try:
+                    if item.is_file():
+                        item.unlink()
+                    elif item.is_dir():
+                        import shutil
+                        shutil.rmtree(item)
+                except Exception as e:
+                    print(f"⚠️ 无法删除 {item.name}: {e}")
+            self.file_cache = {}
+            print("✅ 临时文件清理完成")
+        except Exception as e:
+            print(f"❌ 清理临时目录失败: {e}")
+
     def add_to_file_cache(self, file_hash, file_path):
         """添加文件到缓存"""
         if file_hash and Path(file_path).exists():

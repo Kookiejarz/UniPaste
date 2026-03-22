@@ -198,7 +198,16 @@ class ClipboardListener:
             return ""
 
     def _should_initiate_connection(self, peer_id: str) -> bool:
-        return bool(peer_id) and peer_id != self.device_id and self.device_id > peer_id
+        """
+        决定是否由本端发起连接。
+        通过比较 ID 的哈希值来平衡发起方，避免某些设备总是被动接收请求。
+        """
+        if not peer_id or peer_id == self.device_id:
+            return False
+            
+        my_hash = hashlib.md5(self.device_id.encode()).hexdigest()
+        peer_hash = hashlib.md5(peer_id.encode()).hexdigest()
+        return my_hash > peer_hash
 
     def on_service_found(self, service_info):
         if isinstance(service_info, str):
@@ -1089,6 +1098,7 @@ class ClipboardListener:
 
         if hasattr(self, 'file_handler'):
              self.file_handler.save_file_cache()
+             self.file_handler.cleanup()
 
         print("👋 感谢使用 UniPaste 节点!")
 

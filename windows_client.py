@@ -218,7 +218,18 @@ class WindowsClipboardClient:
         }
 
     def _should_initiate_connection(self, peer_id: str) -> bool:
-        return bool(peer_id) and peer_id != self.device_id and self.device_id > peer_id
+        """
+        决定是否由本端发起连接。
+        为了避免 Windows 总是成为被连接方，我们通过比较 ID 的哈希值来决定，
+        这样发起方在所有设备之间是均匀分布的。
+        """
+        if not peer_id or peer_id == self.device_id:
+            return False
+            
+        # 使用哈希值比较，确保即使主机名字母序小，也有一半几率成为发起方
+        my_hash = hashlib.md5(self.device_id.encode()).hexdigest()
+        peer_hash = hashlib.md5(peer_id.encode()).hexdigest()
+        return my_hash > peer_hash
 
     def _update_connection_status(self):
         if self.peer_connections:
@@ -275,6 +286,7 @@ class WindowsClipboardClient:
         # Save file cache
         if hasattr(self, 'file_handler'):
             self.file_handler.save_file_cache()
+            self.file_handler.cleanup()
             
         # Cancel tasks to wake up from sleep
         if self.event_loop and self.event_loop.is_running():

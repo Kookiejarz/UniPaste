@@ -4,52 +4,118 @@ import secrets
 import hmac
 import hashlib
 import time
+import uuid
+import base64
 from pathlib import Path
+
+try:
+    from cryptography.fernet import Fernet
+except ImportError:
+    Fernet = None
 
 class DeviceAuthManager:
     def __init__(self, auth_file_path=None):
         # 默认存储在用户主目录下
         if auth_file_path is None:
             home_dir = Path.home()
-            self.auth_file = home_dir / ".clipshare" / "auth_devices.json"
+            self.auth_dir = home_dir / ".unipaste"
+            self.auth_file = self.auth_dir / "auth_devices.json"
         else:
             self.auth_file = Path(auth_file_path)
-            
-        # 确保目录存在
-        self.auth_file.parent.mkdir(parents=True, exist_ok=True)
-        
+            self.auth_dir = self.auth_file.parent
+
+        # 确保目录存在并设置严格权限 (仅当前用户)
+        self.auth_dir.mkdir(parents=True, exist_ok=True)
+        if os.name != 'nt': # Unix/Mac
+            os.chmod(self.auth_dir, 0o700)
+            if self.auth_file.exists():
+                os.chmod(self.auth_file, 0o600)
+
+        # 生成硬件绑定密钥
+        self.encryption_key = self._get_hardware_key()
+        self.fernet = Fernet(self.encryption_key) if Fernet else None
+
         # 加载授权设备列表
         self.authorized_devices = self._load_devices()
-        
+
         # 生成服务器密钥（如果不存在）
         self.server_key = self._load_or_create_server_key()
-        
+
+    def _get_hardware_key(self):
+        """生成基于硬件ID的32字节密钥 (Base64编码)"""
+        try:
+            # 组合 MAC 地址和一些系统特征作为种子
+            mac = str(uuid.getnode())
+            seed = f"unipaste-hw-bound-{mac}-{os.getlogin()}"
+            key_hash = hashlib.sha256(seed.encode()).digest()
+            return base64.urlsafe_b64encode(key_hash)
+        except Exception:
+            # Fallback to a fixed but hidden seed if login name fails
+            seed = f"unipaste-hw-fallback-{uuid.getnode()}"
+            key_hash = hashlib.sha256(seed.encode()).digest()
+            return base64.urlsafe_b64encode(key_hash)
+
     def _load_or_create_server_key(self):
-        key_file = self.auth_file.parent / "server_key.txt"
+        key_file = self.auth_dir / "server_key.bin" # Changed to .bin for encrypted
         if key_file.exists():
-            with open(key_file, "r") as f:
-                return f.read().strip()
-        else:
-            # 生成32字节随机密钥
-            new_key = secrets.token_hex(32)
-            with open(key_file, "w") as f:
-                f.write(new_key)
-            return new_key
-            
+            try:
+                with open(key_file, "rb") as f:
+                    encrypted_data = f.read()
+                    if self.fernet:
+                        return self.fernet.decrypt(encrypted_data).decode().strip()
+                    return encrypted_data.decode().strip()
+            except Exception:
+                # If decryption fails (e.g. moved to another PC), generate new
+                pass
+
+        # 生成32字节随机密钥
+        new_key = secrets.token_hex(32)
+        try:
+            with open(key_file, "wb") as f:
+                if self.fernet:
+                    f.write(self.fernet.encrypt(new_key.encode()))
+                else:
+                    f.write(new_key.encode())
+            if os.name != 'nt': os.chmod(key_file, 0o600)
+        except Exception as e:
+            print(f"⚠️ 保存服务器密钥失败: {e}")
+        return new_key
+
     def _load_devices(self):
         if not self.auth_file.exists():
             return {}
-            
+
         try:
-            with open(self.auth_file, "r") as f:
-                return json.load(f)
-        except (json.JSONDecodeError, FileNotFoundError):
+            with open(self.auth_file, "rb") as f:
+                data = f.read()
+                if not data: return {}
+
+                if self.fernet:
+                    try:
+                        decrypted_data = self.fernet.decrypt(data)
+                        return json.loads(decrypted_data)
+                    except Exception:
+                        # Possibly migration from unencrypted or different HW
+                        try:
+                            return json.loads(data)
+                        except:
+                            return {}
+                else:
+                    return json.load(f)
+        except (json.JSONDecodeError, FileNotFoundError, Exception):
             return {}
-            
+
     def _save_devices(self):
-        with open(self.auth_file, "w") as f:
-            json.dump(self.authorized_devices, f, indent=2)
-            
+        try:
+            json_data = json.dumps(self.authorized_devices, indent=2).encode()
+            with open(self.auth_file, "wb") as f:
+                if self.fernet:
+                    f.write(self.fernet.encrypt(json_data))
+                else:
+                    f.write(json_data)
+            if os.name != 'nt': os.chmod(self.auth_file, 0o600)
+        except Exception as e:
+            print(f"⚠️ 保存设备授权列表失败: {e}")
     def authorize_device(self, device_id, device_info=None):
         """授权新设备并生成令牌"""
         token = secrets.token_hex(16)
