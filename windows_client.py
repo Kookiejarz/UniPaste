@@ -1106,6 +1106,7 @@ class WindowsClipboardClient:
             # If file transfer is complete
             if is_complete and completed_path:
                 print(f"✅ 文件接收完成: {completed_path}")
+                completed_path = self.file_handler.materialize_received_path(message, completed_path)
 
                 # Calculate hash of the completed file
                 content_hash = self.file_handler.get_files_content_hash([str(completed_path)])

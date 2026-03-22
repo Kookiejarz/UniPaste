@@ -125,6 +125,8 @@ class ClipboardListener:
     async def _apply_received_file_to_clipboard(self, message: dict, completed_path: Path):
         print(f"✅ 文件接收完成: {completed_path}")
 
+        completed_path = self.file_handler.materialize_received_path(message, completed_path)
+
         content_hash = self.file_handler.get_files_content_hash([str(completed_path)])
         if content_hash and content_hash == self.last_content_hash:
             print("⏭️ 跳过重复文件内容 (与本地最后发送/设置一致)")

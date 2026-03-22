@@ -47,15 +47,28 @@ class ClipMessage:
             file_paths = [file_paths]
             
         file_infos = []
-        for path in file_paths:
-            path_obj = Path(path)
+        for path_entry in file_paths:
+            extra_fields = {}
+            path_value = path_entry
+            if isinstance(path_entry, dict):
+                path_value = path_entry.get("path")
+                extra_fields = {
+                    key: value
+                    for key, value in path_entry.items()
+                    if key != "path" and value is not None
+                }
+
+            path_obj = Path(path_value) if path_value else None
+            if not path_obj:
+                continue
+
             if path_obj.exists():
                 size = path_obj.stat().st_size
                 file_hash = ClipMessage.calculate_file_hash(str(path_obj))
                 chunk_size = ClipMessage.default_chunk_size()
                 total_chunks = (size + chunk_size - 1) // chunk_size if size else 0
                 
-                file_infos.append({
+                file_info = {
                     "filename": path_obj.name,
                     "path": str(path_obj),
                     "size": size,
@@ -68,7 +81,9 @@ class ClipMessage:
                         size,
                         file_hash
                     )
-                })
+                }
+                file_info.update(extra_fields)
+                file_infos.append(file_info)
         
         return ClipMessage.add_event_metadata({
             "type": MessageType.FILE,

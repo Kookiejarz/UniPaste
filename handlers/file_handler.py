@@ -5,6 +5,8 @@ import base64
 import asyncio
 import os
 import time
+import shutil
+import zipfile
 
 from utils.platform_config import IS_MACOS, IS_WINDOWS
 from utils.message_format import ClipMessage, MessageType
@@ -47,6 +49,7 @@ class FileHandler:
     def __init__(self, temp_dir: Path):
         self.temp_dir = temp_dir
         self.file_cache = {}
+        self.shared_item_metadata = {}
         self._init_temp_dir()
         self.load_file_cache()
         self.chunk_size = ClipboardConfig.CHUNK_SIZE
@@ -281,6 +284,7 @@ class FileHandler:
             total_chunks = (file_size + self.chunk_size - 1) // self.chunk_size if file_size else 0
             file_hash = ClipMessage.calculate_file_hash(str(path_obj))
             transfer_id = transfer_id or self.build_transfer_id(path_obj.name, file_size, file_hash)
+            item_metadata = self.shared_item_metadata.get(str(path_obj), {})
             start_chunk = max(0, min(int(start_chunk or 0), total_chunks))
             start_offset = start_chunk * self.chunk_size
 
@@ -297,6 +301,7 @@ class FileHandler:
                 "start_chunk": start_chunk,
                 "origin_device_id": origin_device_id,
                 "event_id": event_id,
+                **item_metadata,
             }
             await send_encrypted_fn(json.dumps(start_message).encode("utf-8"))
 
@@ -324,10 +329,12 @@ class FileHandler:
                         "total_chunks": total_chunks,
                         "chunk_size": self.chunk_size,
                         "size": file_size,
+                        "file_hash": file_hash,
                         "chunk_hash": hashlib.md5(chunk_data).hexdigest(),
                         "chunk_data": base64.b64encode(chunk_data).decode("utf-8"),
                         "origin_device_id": origin_device_id,
                         "event_id": event_id,
+                        **item_metadata,
                     }
 
                     progress = self._format_progress(chunk_index + 1, total_chunks)
@@ -543,23 +550,18 @@ class FileHandler:
         return None
 
     def get_files_content_hash(self, file_paths):
-        """计算多个文件内容的MD5哈希值，跳过不存在的文件"""
+        """计算多个文件/目录内容的稳定MD5哈希值，跳过不存在的路径"""
         md5 = hashlib.md5()
         valid_paths_found = False
         for path_str in file_paths:
             path = Path(path_str)
             try:
-                if not path.is_file():
-                    print(f"⚠️ 跳过非文件或不存在的路径: {path}")
+                if not path.exists():
+                    print(f"⚠️ 跳过不存在的路径: {path}")
                     continue
 
-                with open(path, "rb") as f:
-                    valid_paths_found = True
-                    while True:
-                        chunk = f.read(1024 * 1024)
-                        if not chunk:
-                            break
-                        md5.update(chunk)
+                valid_paths_found = True
+                self._update_path_fingerprint(md5, path, path.name)
             except FileNotFoundError:
                 print(f"⚠️ 文件不存在，跳过哈希: {path}")
             except PermissionError:
@@ -568,6 +570,148 @@ class FileHandler:
                 print(f"❌ 计算文件哈希失败: {path} - {e}")
 
         return md5.hexdigest() if valid_paths_found else None
+
+    def _update_path_fingerprint(self, hasher, path: Path, label: str):
+        if path.is_file():
+            hasher.update(f"F:{label}\n".encode("utf-8"))
+            with open(path, "rb") as f:
+                while True:
+                    chunk = f.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    hasher.update(chunk)
+            return
+
+        if path.is_dir():
+            hasher.update(f"D:{label}\n".encode("utf-8"))
+            for child in sorted(path.iterdir(), key=lambda item: item.name):
+                self._update_path_fingerprint(hasher, child, f"{label}/{child.name}")
+            return
+
+        raise ValueError(f"Unsupported path type: {path}")
+
+    def _build_directory_archive_path(self, dir_path: Path) -> Path:
+        suffix = hashlib.md5(str(dir_path.resolve()).encode("utf-8")).hexdigest()[:10]
+        safe_name = self._sanitize_name(dir_path.name)
+        return self.temp_dir / f".clipboard_dir_{safe_name}_{suffix}.zip"
+
+    def _archive_directory(self, dir_path: Path) -> Path:
+        archive_path = self._build_directory_archive_path(dir_path)
+        archive_path.parent.mkdir(exist_ok=True)
+        archive_path.unlink(missing_ok=True)
+
+        root_name = dir_path.name
+        with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr(f"{root_name}/", b"")
+            for current_root, dir_names, file_names in os.walk(dir_path):
+                dir_names.sort()
+                file_names.sort()
+                current_root_path = Path(current_root)
+                rel_root = current_root_path.relative_to(dir_path)
+                base_arc = Path(root_name) / rel_root if rel_root != Path(".") else Path(root_name)
+
+                for dir_name in dir_names:
+                    zf.writestr(f"{(base_arc / dir_name).as_posix()}/", b"")
+
+                for file_name in file_names:
+                    file_path = current_root_path / file_name
+                    zf.write(file_path, arcname=(base_arc / file_name).as_posix())
+
+        return archive_path
+
+    def prepare_clipboard_entries(self, file_urls):
+        prepared_entries = []
+        for raw_path in file_urls:
+            path_obj = Path(raw_path)
+            if not path_obj.exists():
+                print(f"⚠️ 跳过不存在的路径: {path_obj}")
+                continue
+
+            if path_obj.is_dir():
+                archive_path = self._archive_directory(path_obj)
+                metadata = {
+                    "item_type": "directory",
+                    "clipboard_name": path_obj.name,
+                    "archive_format": "zip",
+                }
+                self.shared_item_metadata[str(archive_path)] = metadata
+                prepared_entries.append({
+                    "path": str(archive_path),
+                    **metadata,
+                })
+                print(f"📦 已打包目录用于传输: {path_obj.name} -> {archive_path.name}")
+                continue
+
+            if path_obj.is_file():
+                metadata = {
+                    "item_type": "file",
+                    "clipboard_name": path_obj.name,
+                }
+                self.shared_item_metadata[str(path_obj)] = metadata
+                prepared_entries.append({
+                    "path": str(path_obj),
+                    **metadata,
+                })
+                continue
+
+            print(f"⚠️ 跳过非文件或非目录路径: {path_obj}")
+
+        return prepared_entries
+
+    def materialize_received_path(self, message: dict, completed_path: Path) -> Path:
+        item_type = message.get("item_type") or "file"
+        if item_type != "directory":
+            return completed_path
+
+        if message.get("archive_format") != "zip":
+            print(f"⚠️ 不支持的目录归档格式: {message.get('archive_format')}")
+            return completed_path
+
+        clipboard_name = self._sanitize_name(message.get("clipboard_name") or completed_path.stem)
+        staging_dir = self.temp_dir / f".extract_{message.get('transfer_id') or completed_path.stem}"
+        final_dir = self.temp_dir / clipboard_name
+
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        staging_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            with zipfile.ZipFile(completed_path, "r") as zf:
+                for member in zf.namelist():
+                    member_path = Path(member)
+                    if member_path.is_absolute() or ".." in member_path.parts:
+                        raise ValueError(f"Illegal archive entry: {member}")
+                zf.extractall(staging_dir)
+
+            extracted_dir = staging_dir / clipboard_name
+            if not extracted_dir.exists():
+                top_level_dirs = [item for item in staging_dir.iterdir() if item.is_dir()]
+                if len(top_level_dirs) != 1:
+                    raise ValueError("Directory archive layout is invalid")
+                extracted_dir = top_level_dirs[0]
+
+            if final_dir.exists():
+                if final_dir.is_dir():
+                    shutil.rmtree(final_dir)
+                else:
+                    final_dir.unlink()
+
+            shutil.move(str(extracted_dir), str(final_dir))
+            shutil.rmtree(staging_dir, ignore_errors=True)
+
+            file_hash = message.get("file_hash")
+            if file_hash:
+                self.add_to_file_cache(file_hash, str(final_dir))
+
+            try:
+                completed_path.unlink(missing_ok=True)
+            except OSError as e:
+                print(f"⚠️ 清理目录归档失败: {e}")
+
+            print(f"📂 已还原目录到临时目录: {final_dir}")
+            return final_dir
+        except Exception:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+            raise
 
     async def handle_received_files(self, file_info_message, send_encrypted_func, sender_websocket=None):
         """
@@ -685,8 +829,12 @@ class FileHandler:
                 print(f"❌ 文件不存在，无法设置到剪贴板: {path_str}")
                 return None
 
-            file_path.chmod(0o644)
-            print("🔓 设置文件权限: 644")
+            if file_path.is_file():
+                file_path.chmod(0o644)
+                print("🔓 设置文件权限: 644")
+            elif file_path.is_dir():
+                file_path.chmod(0o755)
+                print("🔓 设置目录权限: 755")
             if IS_MACOS:
                 print(f"🔄 正在设置文件到剪贴板: {Path(path_str).name}")
                 try:
@@ -787,8 +935,10 @@ class FileHandler:
         event_id=None
     ):
         """处理剪贴板中的文件, 发送文件信息"""
-        file_paths_str = str(sorted(file_urls))
-        content_hash = hashlib.md5(file_paths_str.encode()).hexdigest()
+        content_hash = self.get_files_content_hash(file_urls)
+        if not content_hash:
+            file_paths_str = str(sorted(file_urls))
+            content_hash = hashlib.md5(file_paths_str.encode()).hexdigest()
 
         if content_hash == last_content_hash:
             return content_hash, False
@@ -796,8 +946,13 @@ class FileHandler:
         file_names = [os.path.basename(p) for p in file_urls]
         print(f"📤 发送文件信息: {', '.join(file_names[:3])}{' 等' if len(file_names) > 3 else ''}")
 
+        prepared_entries = self.prepare_clipboard_entries(file_urls)
+        if not prepared_entries:
+            print("⚠️ 没有可发送的文件或目录")
+            return last_content_hash, False
+
         file_msg = ClipMessage.file_message(
-            file_urls,
+            prepared_entries,
             origin_device_id=origin_device_id,
             event_id=event_id
         )
