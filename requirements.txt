@@ -5,7 +5,8 @@ netifaces>=0.11.0
 websockets>=11.0.3
 pywin32>=306; sys_platform == 'win32'
 pystray>=0.19.5; sys_platform == 'win32'
-Pillow>=10.0.0; sys_platform == 'win32'
+Pillow>=10.0.0
 rumps>=0.4.5; sys_platform == 'darwin'
 pyobjc-framework-Cocoa>=9.0.1; sys_platform == 'darwin'
+pyobjc-framework-Quartz>=9.0.1; sys_platform == 'darwin'
 pyobjc-core>=9.0.1; sys_platform == 'darwin'
