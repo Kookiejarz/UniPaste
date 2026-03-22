@@ -5,9 +5,10 @@ from tkinter import messagebox, ttk
 class ControlPanel:
     """Lightweight Tk control panel for status, pairing and autostart."""
 
-    def __init__(self, controller, title="UniPaste"):
+    def __init__(self, controller, title="UniPaste", on_quit_callback=None):
         self.controller = controller
         self.title = title
+        self.on_quit_callback = on_quit_callback
         self.root = None
         self._pairing_rows = {}
         self._refresh_job = None
@@ -175,6 +176,8 @@ class ControlPanel:
 
     def _quit_service(self):
         self.controller.stop()
+        if self.on_quit_callback:
+            self.on_quit_callback()
         self._on_close()
 
     def _on_close(self):

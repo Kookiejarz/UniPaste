@@ -1171,7 +1171,7 @@ def run_tray_app():
             return
 
         def panel_main():
-            panel = ControlPanel(host, title="UniPaste 控制面板")
+            panel = ControlPanel(host, title="UniPaste 控制面板", on_quit_callback=tray.stop)
             panel_state["panel"] = panel
             try:
                 panel.run()

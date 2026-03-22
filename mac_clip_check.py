@@ -1205,6 +1205,9 @@ class SharedHostProxy:
         self.cmd_queue.put(("remove_autostart", None))
         return True, "请求已发送"
 
+    def full_quit(self):
+        self.cmd_queue.put(("full_quit", None))
+
     def stop(self):
         pass # Panel process shouldn't stop the service
 
@@ -1214,7 +1217,7 @@ def run_panel_process(shared_dict, cmd_queue):
     try:
         from utils.control_panel import ControlPanel
         proxy = SharedHostProxy(shared_dict, cmd_queue)
-        panel = ControlPanel(proxy, title="UniPaste 控制面板")
+        panel = ControlPanel(proxy, title="UniPaste 控制面板", on_quit_callback=proxy.full_quit)
         panel.run()
     except Exception as e:
         print(f"❌ 控制面板进程崩溃: {e}")
@@ -1272,6 +1275,8 @@ def run_control_panel():
                                 host.install_autostart()
                             elif cmd == "remove_autostart":
                                 host.remove_autostart()
+                            elif cmd == "full_quit":
+                                rumps.quit_application()
                         except Exception as qe:
                              print(f"⚠️ 处理指令失败: {qe}")
                     

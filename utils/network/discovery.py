@@ -109,10 +109,14 @@ class DeviceDiscovery:
         """Clean up resources, including Zeroconf instance."""
         print("DEBUG: Closing DeviceDiscovery (Zeroconf and Executor).")
         self.stop_browser() # Ensure browser is stopped
-        if hasattr(self, 'zeroconf'):
+        if hasattr(self, 'zeroconf') and self.zeroconf:
             try:
+                print("DEBUG: Closing Zeroconf...")
                 self.zeroconf.close()
+                print("DEBUG: Zeroconf closed.")
             except Exception as e:
                  print(f"⚠️ Error closing zeroconf: {e}")
+            finally:
+                 self.zeroconf = None
         if hasattr(self, '_executor'):
-            self._executor.shutdown(wait=False) # Don't wait indefinitely
+            self._executor.shutdown(wait=False)
