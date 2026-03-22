@@ -16,6 +16,18 @@ __pycache__/
 .pytype/
 .hypothesis/
 
+.build/
+dist/
+/build/
+/dist/
+/package/
+/release/
+/unipaste.spec
+/UniPaste-Mac.spec
+/build_macos_local.log
+.venv/
+.venv-build/
+
 
 # App specific files
 .dstore/
