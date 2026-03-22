@@ -68,16 +68,16 @@ class ClipboardConfig:
     @classmethod
     def get_device_token_path(cls, platform_name: str) -> Path:
         settings = cls.get_platform_settings(platform_name)
-        token_dir = Path.home() / ".clipshare"
+        token_dir = Path.home() / ".unipaste"
         token_dir.mkdir(parents=True, exist_ok=True)
         return token_dir / settings["token_filename"]
     
     # 临时文件路径标识
     TEMP_PATH_INDICATORS = [
-        "\\AppData\\Local\\Temp\\clipshare_files\\",
+        "\\AppData\\Local\\Temp\\unipaste_files\\",
         "/var/folders/",
-        "/tmp/clipshare_files/",
-        "C:\\Users\\\\AppData\\Local\\Temp\\clipshare_files\\"
+        "/tmp/unipaste_files/",
+        "C:\\Users\\\\AppData\\Local\\Temp\\unipaste_files\\"
     ]
 
 
