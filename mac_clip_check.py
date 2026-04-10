@@ -2,6 +2,7 @@ import AppKit
 import asyncio
 import websockets
 import json
+import queue
 import signal
 import time
 import os
@@ -158,179 +159,6 @@ class ClipboardListener(ClipboardNode):
             print(f"⚠️ 发送当前剪贴板快照失败: {e}")
 
 
-    async def _send_encrypted(self, data: bytes, websocket):
-        """Helper to encrypt and send data to a specific websocket."""
-        try:
-            security_mgr = self._get_connection_security(websocket)
-            if not security_mgr or not security_mgr.has_shared_key():
-                raise ValueError("Connection shared key not established")
-            encrypted = security_mgr.encrypt_message(data)
-            async with self._get_send_lock(websocket):
-                await websocket.send(encrypted)
-        except Exception as e:
-            print(f"❌ 发送加密数据失败: {e}")
-            if websocket in self.connected_clients:
-                self.connected_clients.remove(websocket)
-
-
-    async def process_received_data(self, encrypted_data, sender_websocket=None):
-        """处理从对等设备接收到的加密数据"""
-        if not sender_websocket:
-             print("⚠️ process_received_data called without sender_websocket")
-             return
-
-        try:
-            self.is_receiving = True
-            security_mgr = self._get_connection_security(sender_websocket)
-            if not security_mgr or not security_mgr.has_shared_key():
-                raise ValueError("Connection shared key not established")
-            decrypted_data = security_mgr.decrypt_message(encrypted_data)
-            message_json = decrypted_data.decode('utf-8')
-            message = ClipMessage.deserialize(message_json)
-
-            if not message or "type" not in message:
-                 print("⚠️ 收到的消息格式无效或无法解析")
-                 return
-
-            msg_type = message["type"]
-            origin_device_id = message.get("origin_device_id")
-            if origin_device_id and origin_device_id == self.device_id:
-                return
-            print(f"📬 收到消息类型: {msg_type}") # Log received type
-
-            if msg_type == MessageType.TEXT:
-                text = message.get("content", "")
-                if not text:
-                    print("⚠️ 收到空文本消息")
-                    return
-
-                if self.file_handler._looks_like_temp_file_path(text):
-                    return
-
-                content_hash = hashlib.md5(text.encode()).hexdigest()
-
-                if content_hash == self.last_content_hash:
-                     print("⏭️ 跳过重复内容 (与本地最后发送/设置一致)")
-                     return
-
-                self.pasteboard.clearContents()
-                success = self.pasteboard.setString_forType_(text, AppKit.NSPasteboardTypeString)
-
-                if success:
-                    change_count = self.pasteboard.changeCount()
-                    self.last_change_count = change_count
-                    self.last_content_hash = content_hash
-                    self._register_applied_remote_event(message, "text", content_hash, change_count)
-
-                    display_text = text[:ClipboardConfig.MAX_DISPLAY_LENGTH] + ("..." if len(text) > ClipboardConfig.MAX_DISPLAY_LENGTH else "")
-                    print(f"📥 已复制文本: \"{display_text}\"")
-                else:
-                    print("❌ 更新Mac剪贴板失败")
-
-
-            elif msg_type == MessageType.FILE:
-                await self.file_handler.handle_received_files(
-                    message,
-                    lambda data: self._send_encrypted(data, sender_websocket),
-                    sender_websocket=sender_websocket
-                )
-
-            elif msg_type == MessageType.FILE_START:
-                await self.file_handler.handle_transfer_start(message)
-
-            elif msg_type == MessageType.FILE_RESPONSE:
-                is_complete, completed_path = await self.file_handler.handle_received_chunk(
-                    message,
-                    lambda data: self._send_encrypted(data, sender_websocket)
-                )
-                if is_complete and completed_path:
-                    await self._apply_received_file_to_clipboard(message, completed_path)
-
-            elif msg_type == MessageType.FILE_CHUNK:
-                is_complete, completed_path = await self.file_handler.handle_received_chunk(
-                    message,
-                    lambda data: self._send_encrypted(data, sender_websocket)
-                )
-                if is_complete and completed_path:
-                    await self._apply_received_file_to_clipboard(message, completed_path)
-
-            elif msg_type == MessageType.FILE_REQUEST:
-                 file_path_requested = message.get("path")
-                 resume_from_chunk = int(message.get("resume_from_chunk") or 0)
-                 transfer_id = message.get("transfer_id")
-                 event_id = message.get("event_id")
-                 request_origin = message.get("origin_device_id")
-                 if file_path_requested:
-                      normalized_path = file_path_requested.replace('\\', '/')
-                      print(f"📤 收到文件请求: {Path(normalized_path).name}")
-                      print(f"🔍 原始路径: {file_path_requested}")
-                      print(f"🔍 标准化路径: {normalized_path}")
-                      self._schedule_background_transfer(
-                           self.file_handler.handle_file_transfer(
-                               normalized_path,
-                               lambda data: self._send_encrypted(data, sender_websocket),
-                               start_chunk=resume_from_chunk,
-                               transfer_id=transfer_id,
-                               origin_device_id=request_origin,
-                               event_id=event_id
-                           ),
-                           Path(normalized_path).name
-                      )
-                 else:
-                      print("⚠️ 收到的文件请求缺少路径")
-
-            else:
-                 print(f"⚠️ 未知消息类型: {msg_type}")
-
-
-        except json.JSONDecodeError:
-             print("❌ 收到的消息不是有效的JSON")
-        except UnicodeDecodeError:
-             print("❌ 无法将收到的消息解码为UTF-8")
-        except Exception as e:
-            print(f"❌ 处理接收数据时出错: {e}")
-            import traceback
-            traceback.print_exc()
-        finally:
-            self.is_receiving = False
-
-
-    async def broadcast_encrypted_data(self, data_to_encrypt: bytes, exclude_websocket=None):
-        """Encrypt and broadcast data to all active peers."""
-        if not self.connected_clients:
-            return
-
-        active_clients = list(self.connected_clients)
-        broadcast_count = len(active_clients) - (1 if exclude_websocket in active_clients else 0)
-
-        if broadcast_count <= 0:
-            return
-
-        tasks = []
-        for websocket in active_clients:
-            if websocket == exclude_websocket:
-                continue
-            try:
-                security_mgr = self._get_connection_security(websocket)
-                if not security_mgr or not security_mgr.has_shared_key():
-                    continue
-                tasks.append(asyncio.create_task(self._send_encrypted(data_to_encrypt, websocket)))
-            except Exception as e:
-                print(f"❌ 创建广播任务失败: {e}")
-                if websocket in self.connected_clients:
-                    self.connected_clients.remove(websocket)
-
-        if tasks:
-            done, pending = await asyncio.wait(tasks, timeout=10.0)
-
-            if pending:
-                print(f"⚠️ {len(pending)} 个广播任务超时")
-                for task in pending:
-                    task.cancel()
-            for task in done:
-                 if task.exception():
-                      print(f"❌ 广播发送时出错: {task.exception()}")
-
     async def sync_clipboard(self):
         print("🔍 搜索剪贴板服务...")
         self.discovery.start_discovery(self.on_service_found, self.on_service_lost)
@@ -485,14 +313,10 @@ class ClipboardListener(ClipboardNode):
             finally:
                 self.discovery.close()
                 
-                if self.connected_clients:
-                    print(f"📤 正在关闭 {len(self.connected_clients)} 个连接...")
-                    close_tasks = []
-                    for websocket in list(self.connected_clients):
-                        close_tasks.append(websocket.close())
-                    if close_tasks:
-                        await asyncio.gather(*close_tasks, return_exceptions=True)
-                    self.connected_clients.clear()
+                if self.peer_connections:
+                    print(f"📤 正在关闭 {len(self.peer_connections)} 个连接...")
+                    close_tasks = [ws.close() for ws in list(self.peer_connections.values())]
+                    await asyncio.gather(*close_tasks, return_exceptions=True)
                 
                 if self.server:
                     self.server.close()
@@ -687,6 +511,9 @@ class MacTrayApp(rumps.App):
         ]
         self._status_timer = rumps.Timer(self._update_status, 3)
         self._status_timer.start()
+        self._notification_queue = queue.Queue()
+        self._notif_timer = rumps.Timer(self._flush_notifications, 0.5)
+        self._notif_timer.start()
 
     def _update_status(self, _):
         try:
@@ -721,11 +548,15 @@ class MacTrayApp(rumps.App):
         else:
             subtitle = f"已发送: {filename}"
             message = ""
-        rumps.notification(
-            title="UniPaste · 文件传输完成",
-            subtitle=subtitle,
-            message=message,
-        )
+        self._notification_queue.put(("UniPaste · 文件传输完成", subtitle, message))
+
+    def _flush_notifications(self, _):
+        while not self._notification_queue.empty():
+            try:
+                title, subtitle, message = self._notification_queue.get_nowait()
+                rumps.notification(title=title, subtitle=subtitle, message=message)
+            except Exception:
+                break
 
 
 # ------------------------------------------------------------------

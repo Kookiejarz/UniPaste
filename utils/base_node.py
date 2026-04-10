@@ -293,21 +293,6 @@ class ClipboardNode(ABC):
         if callable(self.ui_transfer_notify_callback):
             self.ui_transfer_notify_callback(filename, peer_id, direction)
 
-        if sys.stdin and sys.stdin.isatty():
-            print("是否允许此设备连接? (输入 'y' 接受, 'n' 拒绝)")
-
-            def get_user_input():
-                try:
-                    choice = input().strip().lower()
-                    if choice in ['y', 'yes', 'accept', '是', '接受']:
-                        self.pairing_mgr.accept_pairing(request.device_id)
-                    else:
-                        self.pairing_mgr.reject_pairing(request.device_id)
-                except Exception:
-                    self.pairing_mgr.reject_pairing(request.device_id)
-
-            threading.Thread(target=get_user_input, daemon=True).start()
-
     def report_ui_error(self, message: str):
         self.last_ui_error = message
 
@@ -991,7 +976,9 @@ class ClipboardNode(ABC):
             return
         print("\n⏹️ 正在停止节点...")
         self.running = False
-        self.discovery.close()
+        # Run discovery.close() in a daemon thread — zeroconf.close() can block
+        # waiting for its own threads, and we don't want to stall the caller
+        threading.Thread(target=self.discovery.close, daemon=True, name="discovery-close").start()
 
         if self.event_loop and self.event_loop.is_running():
             for task_attr in ['server_task', 'clipboard_task', 'sync_task', 'status_task']:

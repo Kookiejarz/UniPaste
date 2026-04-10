@@ -350,6 +350,7 @@ def run_tray_app():
     finally:
         host.stop()
         host.join(5)
+        os._exit(0)  # Force exit — zeroconf creates non-daemon threads that would otherwise block
 
 
 def parse_args():

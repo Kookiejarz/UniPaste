@@ -55,6 +55,7 @@ class FileHandler:
         self.chunk_size = ClipboardConfig.CHUNK_SIZE
         self.pending_transfers = {}
         self.active_outbound = {}  # transfer_id -> {filename, file_size, sent_chunks, total_chunks}
+        self.recently_completed = {}  # transfer_id -> {completed_at, filename, peer_id, direction, file_size}
         self.on_transfer_complete = None  # callback(filename, peer_id, direction)
 
     def _init_temp_dir(self):
@@ -368,6 +369,13 @@ class FileHandler:
                 self.active_outbound.pop(transfer_id, None)
 
             print(f"\n✅ 文件 {path_obj.name} 传输完成")
+            self.recently_completed[transfer_id] = {
+                "completed_at": time.time(),
+                "filename": path_obj.name,
+                "peer_id": origin_device_id,
+                "direction": "send",
+                "file_size": file_size,
+            }
             if callable(self.on_transfer_complete):
                 self.on_transfer_complete(path_obj.name, origin_device_id, "send")
             return True
@@ -391,11 +399,14 @@ class FileHandler:
     def get_active_transfers(self) -> list:
         """返回当前所有活跃传输的状态，供 UI snapshot 使用。"""
         result = []
+        active_ids = set()
+
         for tid, t in list(self.pending_transfers.items()):
             total = t.get("total_chunks", 0)
             done = t.get("next_chunk", 0)
             pct = int(done * 100 / total) if total > 0 else 0
             file_size = t.get("file_size", 0)
+            active_ids.add(tid)
             result.append({
                 "transfer_id": tid,
                 "filename": t.get("filename", ""),
@@ -411,6 +422,7 @@ class FileHandler:
             pct = int(done * 100 / total) if total > 0 else 0
             file_size = t.get("file_size", 0)
             sent_bytes = int(done * file_size / total) if total > 0 else 0
+            active_ids.add(tid)
             result.append({
                 "transfer_id": tid,
                 "filename": t.get("filename", ""),
@@ -420,6 +432,25 @@ class FileHandler:
                 "direction": "send",
                 "peer_id": None,
             })
+
+        # Keep recently completed transfers visible at 100% for 3 seconds
+        now = time.time()
+        stale = [tid for tid, t in self.recently_completed.items() if now - t["completed_at"] > 3]
+        for tid in stale:
+            del self.recently_completed[tid]
+        for tid, t in self.recently_completed.items():
+            if tid not in active_ids:
+                result.append({
+                    "transfer_id": tid,
+                    "filename": t["filename"],
+                    "file_size": t["file_size"],
+                    "received_bytes": t["file_size"],
+                    "percent": 100,
+                    "direction": t["direction"],
+                    "peer_id": t["peer_id"],
+                    "completed": True,
+                })
+
         return result
 
     async def handle_received_chunk(self, message: dict, send_encrypted_fn=None) -> tuple[bool, Path | None]:
@@ -547,10 +578,19 @@ class FileHandler:
             content_fingerprint = transfer.get("content_fingerprint")
             if content_fingerprint and content_fingerprint != final_hash:
                 self.add_to_file_cache(content_fingerprint, str(final_path))
+            file_size_done = transfer.get("file_size", 0)
+            origin = transfer.get("origin_device_id")
             self._discard_transfer_state(transfer_id, remove_partial=False)
+            self.recently_completed[transfer_id] = {
+                "completed_at": time.time(),
+                "filename": filename,
+                "peer_id": origin,
+                "direction": "receive",
+                "file_size": file_size_done,
+            }
             print(f"✅ 文件 {filename} 哈希校验成功")
             if callable(self.on_transfer_complete):
-                self.on_transfer_complete(filename, transfer.get("origin_device_id"), "receive")
+                self.on_transfer_complete(filename, origin, "receive")
             return True, final_path
 
         except Exception as e:
