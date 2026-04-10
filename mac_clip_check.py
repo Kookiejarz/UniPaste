@@ -10,24 +10,19 @@ import sys
 import argparse
 import rumps
 import threading
+import traceback
 import multiprocessing
 from multiprocessing import Process, Manager, Queue
-
-from utils.security.crypto import SecurityManager
-from utils.security.auth import DeviceAuthManager
-from utils.network.discovery import DeviceDiscovery
-from utils.message_format import ClipMessage, MessageType
-from utils.clipboard_loop_guard import ClipboardLoopGuard
 from pathlib import Path
 import hashlib
-from handlers.file_handler import FileHandler
-from config import ClipboardConfig
-from utils.security.pairing import PairingManager, PairingStatus
-import threading
+
+from utils.base_node import ClipboardNode
+from utils.message_format import ClipMessage, MessageType
 from utils.clipboard_utils import ClipboardUtils
 from utils.service_host import ServiceHost
-from utils.control_panel import ControlPanel
 from utils.autostart import MacLaunchAgentManager
+from config import ClipboardConfig
+
 
 def _resource_path(*parts: str) -> str:
     if getattr(sys, "frozen", False):
@@ -36,65 +31,39 @@ def _resource_path(*parts: str) -> str:
         base_dir = Path(__file__).resolve().parent
     return str(base_dir.joinpath(*parts))
 
-class ClipboardListener:
-    """剪贴板监听和同步节点"""
+
+class ClipboardListener(ClipboardNode):
+    """macOS 剪贴板监听和同步节点"""
 
     def __init__(self):
-        """初始化剪贴板监听器"""
-        self.platform_name = "macos"
-        self._init_basic_components()
-        self._init_state_flags()
-        self._init_file_handling()
-        self.device_id = self._get_device_id()
-        self.device_name = ClipboardConfig.get_device_name(self.platform_name)
-        self.device_token = self._load_device_token()
-        self.pairing_mgr = PairingManager(timeout_seconds=ClipboardConfig.PAIRING_TIMEOUT_SECONDS)
-        self.pairing_mgr.set_pairing_callback(self._on_pairing_request)
-        self.discovered_peers = {}
-        self.service_name_to_id = {}
-        self.peer_connections = {}
-        self.websocket_peer_ids = {}
-        self.connection_security = {}
-        self.connection_send_locks = {}
-        self.peer_retry_state = {}
-        self.loop_guard = ClipboardLoopGuard()
-        self.background_tasks = set()
-        self.status_task = None
-        self.event_loop = None
-        self.last_ui_error = None
-        self.server_task = None
-        self.clipboard_task = None
-        self.sync_task = None
-        self.discovery_event = asyncio.Event()
-
-
-    def _init_basic_components(self):
-        """初始化基础组件"""
-        try:
-            self.pasteboard = AppKit.NSPasteboard.generalPasteboard()
-            self.auth_mgr = DeviceAuthManager()
-            self.discovery = DeviceDiscovery()
-            self.connected_clients = set()
-            print("✅ 基础组件初始化成功")
-        except Exception as e:
-            print(f"❌ 基础组件初始化失败: {e}")
-            raise
-
-    def _init_state_flags(self):
-        """初始化状态标志"""
+        super().__init__("macos")
+        self.pasteboard = AppKit.NSPasteboard.generalPasteboard()
         self.last_change_count = self.pasteboard.changeCount()
-        self.last_content_hash = None
-        self.is_receiving = False # Flag to prevent processing while receiving
-        self.running = True
-        self.server = None
 
-    def _build_clipboard_snapshot(self):
-        file_paths = ClipboardUtils.get_clipboard_files()
-        if file_paths:
-            return {
-                "kind": "files",
-                "fingerprint": self.file_handler.get_files_content_hash(file_paths),
-            }
+    # ------------------------------------------------------------------
+    # Abstract method implementations
+    # ------------------------------------------------------------------
+
+    def _read_clipboard_snapshot(self) -> dict | None:
+        """Read current clipboard state from NSPasteboard."""
+        types = self.pasteboard.types()
+
+        if AppKit.NSPasteboardTypeFileURL in types:
+            file_urls = []
+            for item in self.pasteboard.pasteboardItems():
+                url_str = item.stringForType_(AppKit.NSPasteboardTypeFileURL)
+                if not url_str:
+                    continue
+                url = AppKit.NSURL.URLWithString_(url_str)
+                if url and url.isFileURL():
+                    file_path = url.path()
+                    if file_path and Path(file_path).exists():
+                        file_urls.append(file_path)
+            if file_urls:
+                return {
+                    "kind": "files",
+                    "fingerprint": self.file_handler.get_files_content_hash(file_urls),
+                }
 
         text = self.pasteboard.stringForType_(AppKit.NSPasteboardTypeString)
         if text:
@@ -104,34 +73,17 @@ class ClipboardListener:
             }
         return None
 
-    def _consume_expected_clipboard_echo(self, change_count: int) -> bool:
-        snapshot = self._build_clipboard_snapshot()
-        if not snapshot:
-            return False
-
-        event = self.loop_guard.consume_if_expected(
-            kind=snapshot["kind"],
-            fingerprint=snapshot["fingerprint"],
-            change_count=change_count,
-        )
-        if not event:
-            return False
-
-        self.last_change_count = change_count
-        self.last_content_hash = snapshot["fingerprint"]
-        print(f"⏭️ 已消费远端{event.kind}剪贴板回显，不再回传")
-        return True
-
-    def _register_applied_remote_event(self, message: dict, kind: str, fingerprint: str | None, change_count: int | None):
-        self.loop_guard.register(
-            kind=kind,
-            fingerprint=fingerprint,
-            expected_change_count=change_count,
-            event_id=message.get("event_id"),
-            origin_device_id=message.get("origin_device_id"),
-        )
+    async def _apply_text_to_clipboard(self, text: str) -> int | None:
+        """Write text to NSPasteboard. Returns new changeCount or None on failure."""
+        self.pasteboard.clearContents()
+        success = self.pasteboard.setString_forType_(text, AppKit.NSPasteboardTypeString)
+        if success:
+            return self.pasteboard.changeCount()
+        print("❌ 更新Mac剪贴板失败")
+        return None
 
     async def _apply_received_file_to_clipboard(self, message: dict, completed_path: Path):
+        """Set a received file onto the NSPasteboard."""
         print(f"✅ 文件接收完成: {completed_path}")
 
         completed_path = self.file_handler.materialize_received_path(message, completed_path)
@@ -154,442 +106,9 @@ class ClipboardListener:
         print("✅ 文件已设置到剪贴板并可用于粘贴")
         print("🔄 文件已登记为远端事件回显，下一次变化不会回传")
 
-    def _init_file_handling(self):
-        """初始化文件处理相关"""
-        try:
-            self.temp_dir = ClipboardConfig.get_temp_dir()
-            self.file_handler = FileHandler(self.temp_dir)
-            self.file_handler.load_file_cache()
-        except Exception as e:
-            print(f"❌ 文件处理初始化失败: {e}")
-            raise
-
-    def _get_device_id(self):
-        import socket
-        import uuid
-        try:
-            hostname = socket.gethostname()
-            mac_num = uuid.getnode()
-            mac = ':'.join(('%012X' % mac_num)[i:i+2] for i in range(0, 12, 2))
-            mac_part = mac.replace(':', '')[-6:]
-            return f"{hostname}-{mac_part}"
-        except Exception:
-            return f"mac-{int(time.time())}"
-
-    def _get_token_path(self):
-        return ClipboardConfig.get_device_token_path(self.platform_name)
-
-    def _load_device_token(self):
-        token_path = self._get_token_path()
-        if token_path.exists():
-            try:
-                with open(token_path, "r") as f:
-                    return f.read().strip()
-            except Exception as e:
-                print(f"❌ 加载设备令牌失败: {e}")
-        return None
-
-    def _save_device_token(self, token):
-        token_path = self._get_token_path()
-        try:
-            with open(token_path, "w") as f:
-                f.write(token)
-        except Exception as e:
-            print(f"❌ 保存设备令牌失败: {e}")
-
-    def _generate_signature(self):
-        if not self.device_token:
-            return ""
-        try:
-            return hmac.new(
-                self.device_token.encode(),
-                self.device_id.encode(),
-                hashlib.sha256
-            ).hexdigest()
-        except Exception as e:
-            print(f"❌ 生成签名失败: {e}")
-            return ""
-
-    def _should_initiate_connection(self, peer_id: str) -> bool:
-        """
-        决定是否由本端发起连接。
-        通过比较 ID 的哈希值来平衡发起方，避免某些设备总是被动接收请求。
-        """
-        if not peer_id or peer_id == self.device_id:
-            return False
-            
-        my_hash = hashlib.md5(self.device_id.encode()).hexdigest()
-        peer_hash = hashlib.md5(peer_id.encode()).hexdigest()
-        return my_hash > peer_hash
-
-    def on_service_found(self, service_info):
-        if isinstance(service_info, str):
-            service_info = {"url": service_info, "properties": {}}
-
-        url = service_info.get("url")
-        properties = service_info.get("properties", {})
-        peer_id = properties.get("device_id")
-        platform = properties.get("platform", "unknown")
-        service_name = service_info.get("name")
-
-        if not url or not peer_id or peer_id == self.device_id:
-            return
-
-        self.discovered_peers[peer_id] = {
-            "url": url,
-            "platform": platform,
-        }
-        if service_name:
-            self.service_name_to_id[service_name] = peer_id
-            
-        print(f"✅ 发现设备 {peer_id} ({platform}): {url}")
-        
-        # 触发同步事件，唤醒挂起的重连循环
-        if self.event_loop and self.event_loop.is_running():
-            self.event_loop.call_soon_threadsafe(self.discovery_event.set)
-
-    def on_service_lost(self, service_name):
-        """服务丢失回调"""
-        peer_id = self.service_name_to_id.pop(service_name, None)
-        if peer_id:
-            if peer_id in self.discovered_peers:
-                del self.discovered_peers[peer_id]
-                print(f"➖ 设备离线: {peer_id}")
-
-    def _register_peer(self, peer_id, websocket):
-        existing = self.peer_connections.get(peer_id)
-        if existing and existing != websocket:
-            return False
-        self.peer_connections[peer_id] = websocket
-        self.websocket_peer_ids[websocket] = peer_id
-        self.connected_clients.add(websocket)
-        self.connection_send_locks.setdefault(websocket, asyncio.Lock())
-        return True
-
-    def _unregister_peer(self, websocket):
-        peer_id = self.websocket_peer_ids.pop(websocket, None)
-        if peer_id and self.peer_connections.get(peer_id) == websocket:
-            del self.peer_connections[peer_id]
-        self.connected_clients.discard(websocket)
-        self.connection_security.pop(websocket, None)
-        self.connection_send_locks.pop(websocket, None)
-        return peer_id
-
-    def _get_connection_security(self, websocket, create=False):
-        manager = self.connection_security.get(websocket)
-        if manager is None and create:
-            manager = SecurityManager()
-            manager.generate_key_pair()
-            self.connection_security[websocket] = manager
-        return manager
-
-    def _get_send_lock(self, websocket):
-        return self.connection_send_locks.setdefault(websocket, asyncio.Lock())
-
-    def _track_background_task(self, task: asyncio.Task):
-        self.background_tasks.add(task)
-
-        def _cleanup(done_task: asyncio.Task):
-            self.background_tasks.discard(done_task)
-            if done_task.cancelled():
-                return
-            try:
-                exc = done_task.exception()
-            except Exception as error:
-                print(f"❌ 后台任务状态读取失败: {error}")
-                return
-            if exc:
-                print(f"❌ 后台任务执行失败: {exc}")
-
-        task.add_done_callback(_cleanup)
-        return task
-
-    def _schedule_background_transfer(self, transfer_coro, label: str):
-        async def _runner():
-            try:
-                await transfer_coro
-            except asyncio.CancelledError:
-                print(f"⏹️ 后台文件传输已取消: {label}")
-                raise
-            except Exception as e:
-                print(f"❌ 后台文件传输失败 ({label}): {e}")
-                import traceback
-                traceback.print_exc()
-
-        return self._track_background_task(asyncio.create_task(_runner()))
-
-    def _get_peer_retry_state(self, peer_id):
-        return self.peer_retry_state.setdefault(
-            peer_id,
-            {"failures": 0, "next_retry_at": 0.0},
-        )
-
-    def _reset_peer_retry(self, peer_id):
-        if peer_id:
-            self.peer_retry_state.pop(peer_id, None)
-
-    def _mark_peer_failure(self, peer_id, error=None):
-        if not peer_id:
-            return
-
-        state = self._get_peer_retry_state(peer_id)
-        state["failures"] += 1
-        delay = min(
-            ClipboardConfig.PEER_RETRY_BASE_DELAY * (2 ** (state["failures"] - 1)),
-            ClipboardConfig.PEER_RETRY_MAX_DELAY,
-        )
-        state["next_retry_at"] = time.time() + delay
-
-        if error:
-            print(f"⏳ 设备 {peer_id} 进入冷却 {delay:.0f} 秒: {error}")
-        else:
-            print(f"⏳ 设备 {peer_id} 进入冷却 {delay:.0f} 秒")
-
-    @staticmethod
-    def _is_expected_peer_unavailable_error(error) -> bool:
-        if isinstance(error, (asyncio.TimeoutError, TimeoutError)):
-            return True
-        if isinstance(error, websockets.exceptions.ConnectionClosed):
-            return getattr(error, "code", None) in {1000, 1001}
-
-        message = str(error).lower()
-        expected_markers = (
-            "timed out during opening handshake",
-            "received 1000",
-            "received 1001",
-            "connection refused",
-            "connect call failed",
-            "server rejected websocket connection",
-        )
-        return any(marker in message for marker in expected_markers)
-
-    def _on_pairing_request(self, request):
-        print(f"\n{'='*60}")
-        print(f"🔗 新设备请求配对:")
-        print(f"   设备名称: {request.device_name}")
-        print(f"   平台: {request.platform}")
-        print(f"   IP地址: {request.ip_address}")
-        print(f"   设备ID: {request.device_id}")
-        print(f"{'='*60}")
-        print("请在控制面板中确认是否允许此设备连接")
-
-        if callable(self.ui_attention_callback):
-            self.ui_attention_callback()
-            return
-
-        if sys.stdin and sys.stdin.isatty():
-            print("是否允许此设备连接? (输入 'y' 接受, 'n' 拒绝)")
-
-            def get_user_input():
-                try:
-                    choice = input().strip().lower()
-                    if choice in ['y', 'yes', 'accept', '是', '接受']:
-                        self.pairing_mgr.accept_pairing(request.device_id)
-                    else:
-                        self.pairing_mgr.reject_pairing(request.device_id)
-                except Exception:
-                    self.pairing_mgr.reject_pairing(request.device_id)
-
-            threading.Thread(target=get_user_input, daemon=True).start()
-
-    def report_ui_error(self, message: str):
-        self.last_ui_error = message
-
-    def accept_pairing_request(self, device_id: str) -> bool:
-        return self.pairing_mgr.accept_pairing(device_id)
-
-    def reject_pairing_request(self, device_id: str) -> bool:
-        return self.pairing_mgr.reject_pairing(device_id)
-
-    def _status_text(self) -> str:
-        if not self.running:
-            return "已停止"
-        if self.peer_connections:
-            return f"已连接 {len(self.peer_connections)} 台设备"
-        if self.discovered_peers:
-            return "已发现设备，等待连接"
-        return "正在后台监听"
-
-    def get_ui_snapshot(self):
-        now = time.time()
-        connected_peers = []
-        for peer_id in sorted(self.peer_connections):
-            peer_info = self.discovered_peers.get(peer_id, {})
-            connected_peers.append({
-                "peer_id": peer_id,
-                "platform": peer_info.get("platform", "unknown"),
-                "url": peer_info.get("url"),
-            })
-
-        discovered_peers = []
-        for peer_id, peer_info in sorted(self.discovered_peers.items()):
-            retry_state = self.peer_retry_state.get(peer_id)
-            retry_in = 0.0
-            if retry_state and retry_state["next_retry_at"] > now:
-                retry_in = retry_state["next_retry_at"] - now
-            discovered_peers.append({
-                "peer_id": peer_id,
-                "platform": peer_info.get("platform", "unknown"),
-                "url": peer_info.get("url"),
-                "connected": peer_id in self.peer_connections,
-                "retry_in": retry_in if retry_in > 0 else None,
-            })
-
-        pending_pairings = [
-            {
-                "device_id": request.device_id,
-                "device_name": request.device_name,
-                "platform": request.platform,
-                "ip_address": request.ip_address,
-            }
-            for request in self.pairing_mgr.list_pending_requests()
-        ]
-
-        return {
-            "platform": self.platform_name,
-            "device_name": self.device_name,
-            "device_id": self.device_id,
-            "status_text": self._status_text(),
-            "connected_peers": connected_peers,
-            "discovered_peers": discovered_peers,
-            "pending_pairings": pending_pairings,
-            "last_error": self.last_ui_error,
-        }
-
-    async def handle_client(self, websocket):
-        """处理入站 WebSocket 连接"""
-        device_id = None
-        client_ip = websocket.remote_address[0] if websocket.remote_address else "未知IP"
-        try:
-            auth_message = await websocket.recv()
-            try:
-                if isinstance(auth_message, str):
-                    message_data = json.loads(auth_message)
-                else:
-                    message_data = json.loads(auth_message.decode('utf-8'))
-
-                device_id = message_data.get('identity', f'unknown-{client_ip}')
-                signature = message_data.get('signature', '')
-                is_first_time = message_data.get('first_time', False)
-
-                print(f"📱 设备 {device_id} ({client_ip}) 尝试连接")
-
-                if is_first_time:
-                    print(f"🆕 设备 {device_id} 首次连接，需要配对...")
-                    pairing_request = await self.pairing_mgr.request_pairing(
-                        device_id, message_data, client_ip
-                    )
-                    pairing_result = await self.pairing_mgr.wait_for_pairing_result(device_id)
-                    
-                    if pairing_result == PairingStatus.ACCEPTED:
-                        token = self.auth_mgr.authorize_device(device_id, {
-                            "name": message_data.get("device_name", "未命名设备"),
-                            "platform": message_data.get("platform", "未知平台"),
-                            "ip": client_ip
-                        })
-                        await websocket.send(json.dumps({
-                            'status': 'pairing_accepted',
-                            'peer_id': self.device_id,
-                            'token': token
-                        }))
-                        print(f"✅ 设备 {device_id} 配对成功并已授权")
-                    elif pairing_result == PairingStatus.REJECTED:
-                        await websocket.send(json.dumps({
-                            'status': 'pairing_rejected',
-                            'reason': 'User rejected pairing request',
-                            'peer_id': self.device_id
-                        }))
-                        print(f"❌ 设备 {device_id} 配对被拒绝")
-                        return
-                    else:  # EXPIRED
-                        await websocket.send(json.dumps({
-                            'status': 'pairing_expired',
-                            'reason': 'Pairing request timed out',
-                            'peer_id': self.device_id
-                        }))
-                        print(f"⏰ 设备 {device_id} 配对请求超时")
-                        return
-                else:
-                    # Existing device authentication
-                    print(f"🔐 验证设备 {device_id} 的签名")
-                    is_valid = self.auth_mgr.validate_device(device_id, signature)
-                    if not is_valid:
-                        print(f"❌ 设备 {device_id} 验证失败")
-                        await websocket.send(json.dumps({
-                            'status': 'unauthorized',
-                            'reason': 'Invalid signature or unknown device',
-                            'peer_id': self.device_id
-                        }))
-                        return # Close connection
-                    await websocket.send(json.dumps({
-                        'status': 'authorized',
-                        'peer_id': self.device_id
-                    }))
-                    print(f"✅ 设备 {device_id} 验证成功")
-
-            except json.JSONDecodeError:
-                print(f"❌ 来自 {client_ip} 的无效消息格式")
-                await websocket.send(json.dumps({
-                    'status': 'error',
-                    'reason': 'Invalid message format'
-                }))
-                return
-            except Exception as auth_err:
-                print(f"❌ 处理消息错误 for {device_id or client_ip}: {auth_err}")
-                await websocket.send(json.dumps({
-                    'status': 'error',
-                    'reason': f'Message processing failed: {auth_err}'
-                }))
-                return
-
-            if not await self.perform_key_exchange(websocket):
-                print(f"❌ 与 {device_id} 的密钥交换失败，断开连接")
-                return
-
-            if not self._register_peer(device_id, websocket):
-                print(f"⚠️ 已存在与 {device_id} 的连接，关闭重复入站连接")
-                await websocket.close()
-                return
-            print(f"✅ 设备 {device_id} 已连接并完成密钥交换")
-            await self.send_current_clipboard_to_peer(websocket)
-
-            while self.running:
-                try:
-                    encrypted_data = await asyncio.wait_for(websocket.recv(), timeout=30.0)
-                    await self.process_received_data(encrypted_data, sender_websocket=websocket)
-                except asyncio.TimeoutError:
-                    try:
-                        pong_waiter = await websocket.ping()
-                        await asyncio.wait_for(pong_waiter, timeout=5)
-                    except (asyncio.TimeoutError, websockets.exceptions.ConnectionClosed):
-                        print(f"⌛ 与 {device_id} 的连接超时或关闭，断开")
-                        break
-                    continue
-                except asyncio.CancelledError:
-                    print(f"⏹️ {device_id} 的连接处理已取消")
-                    break
-                except websockets.exceptions.ConnectionClosedOK:
-                     print(f"ℹ️ 设备 {device_id} 正常断开连接")
-                     break
-                except websockets.exceptions.ConnectionClosedError as e:
-                     print(f"🔌 设备 {device_id} 异常断开连接: {e}")
-                     break
-                except Exception as e:
-                    print(f"❌ 处理来自 {device_id} 的数据时出错: {e}")
-                    import traceback
-                    traceback.print_exc()
-                    await asyncio.sleep(1)
-
-        except websockets.exceptions.ConnectionClosed as e:
-            # This might catch cases where connection closes before loop starts
-            print(f"📴 设备 {device_id or client_ip} 连接已关闭: {e}")
-        except Exception as e:
-            print(f"❌ 处理入站连接 {device_id or client_ip} 时发生意外错误: {e}")
-            import traceback
-            traceback.print_exc()
-        finally:
-            removed_peer = self._unregister_peer(websocket)
-            print(f"➖ 设备 {removed_peer or device_id or client_ip} 已断开")
+    async def _watch_clipboard(self):
+        """Alias for check_clipboard — satisfies the abstract method requirement."""
+        await self.check_clipboard()
 
     async def send_current_clipboard_to_peer(self, websocket):
         """向新连接设备发送当前剪贴板快照，便于恢复未完成传输。"""
@@ -713,8 +232,7 @@ class ClipboardListener:
                 await self.file_handler.handle_received_files(
                     message,
                     lambda data: self._send_encrypted(data, sender_websocket),
-                    sender_websocket=sender_websocket,
-                    current_content_hash=self.last_content_hash
+                    sender_websocket=sender_websocket
                 )
 
             elif msg_type == MessageType.FILE_START:
@@ -1026,10 +544,8 @@ class ClipboardListener:
                 break
             except Exception as e:
                 print(f"❌ 剪贴板监听错误: {e}")
-                import traceback
                 traceback.print_exc()
                 await asyncio.sleep(1)
-
 
     async def process_clipboard(self) -> bool:
         """
@@ -1052,7 +568,7 @@ class ClipboardListener:
                             else:
                                 print(f"⚠️ 剪贴板中的文件路径无效或不存在: {file_path}")
 
-                if file_urls and self.connected_clients:
+                if file_urls and self.peer_connections:
                     new_hash, update_sent = await self.file_handler.handle_clipboard_files(
                         file_urls,
                         self.last_content_hash,
@@ -1070,7 +586,7 @@ class ClipboardListener:
 
             if AppKit.NSPasteboardTypeString in types:
                 text = self.pasteboard.stringForType_(AppKit.NSPasteboardTypeString)
-                if text and self.connected_clients:
+                if text and self.peer_connections:
                     new_hash, update_sent = await self.file_handler.process_clipboard_content(
                         text,
                         self.last_content_hash,
@@ -1088,89 +604,14 @@ class ClipboardListener:
 
         except Exception as e:
             print(f"❌ 处理剪贴板内容时出错: {e}")
-            import traceback
             traceback.print_exc()
 
-        return sent_update # Return whether an update was sent
+        return sent_update
 
 
-    async def perform_key_exchange(self, websocket):
-        """Perform key exchange with an inbound peer"""
-        security_mgr = self._get_connection_security(websocket, create=True)
-
-        async def send_to_websocket(data):
-            await websocket.send(data)
-
-        async def receive_from_websocket():
-            return await websocket.recv()
-
-        return await security_mgr.perform_key_exchange(
-            send_to_websocket,
-            receive_from_websocket
-        )
-
-    async def perform_key_exchange_as_client(self, websocket):
-        try:
-            security_mgr = self._get_connection_security(websocket, create=True)
-
-            peer_key_message = await asyncio.wait_for(websocket.recv(), timeout=10.0)
-            peer_data = json.loads(peer_key_message)
-
-            if peer_data.get("type") != "key_exchange":
-                print("❌ 对端未按预期发送公钥")
-                return False
-
-            peer_key_data = peer_data.get("public_key")
-            peer_public_key = security_mgr.deserialize_public_key(peer_key_data)
-
-            client_public_key = security_mgr.serialize_public_key()
-            await websocket.send(json.dumps({
-                "type": "key_exchange",
-                "public_key": client_public_key
-            }))
-
-            security_mgr.generate_shared_key(peer_public_key)
-            confirmation = await asyncio.wait_for(websocket.recv(), timeout=10.0)
-            confirm_data = json.loads(confirmation)
-            return confirm_data.get("type") == "key_exchange_complete" and confirm_data.get("status") == "success"
-        except Exception as e:
-            print(f"❌ 密钥交换失败: {e}")
-            return False
-
-    def stop(self):
-        """Signals the node and related tasks to stop."""
-        if not self.running:
-             return
-        print("\n⏹️ 正在请求停止节点...")
-        self.running = False
-
-        if self.event_loop and self.event_loop.is_running():
-            for task_attr in ['server_task', 'clipboard_task', 'sync_task']:
-                task = getattr(self, task_attr, None)
-                if task and not task.done():
-                    self.event_loop.call_soon_threadsafe(task.cancel)
-            for task in list(self.background_tasks):
-                if not task.done():
-                    self.event_loop.call_soon_threadsafe(task.cancel)
-
-            if hasattr(self, '_stop_server_func'):
-                self.event_loop.call_soon_threadsafe(self._stop_server_func)
-        else:
-            if hasattr(self, '_stop_server_func'):
-                self._stop_server_func()
-
-        self.discovery.close()
-
-        print("👋 感谢使用 UniPaste 节点!")
-
-    async def finalize_shutdown(self):
-        if self.background_tasks:
-            await asyncio.gather(*list(self.background_tasks), return_exceptions=True)
-
-        if hasattr(self, 'file_handler'):
-             self.file_handler.save_file_cache()
-             self.file_handler.cleanup()
-
+# ------------------------------------------------------------------
+# Runner functions
+# ------------------------------------------------------------------
 
 async def run_listener(listener: ClipboardListener):
     listener.event_loop = asyncio.get_running_loop()
@@ -1180,20 +621,19 @@ async def run_listener(listener: ClipboardListener):
     def signal_handler():
         print("\n⚠️ 接收到关闭信号...")
         if not stop_event.is_set():
-             listener.stop()
-             stop_event.set()
+            listener.stop()
+            stop_event.set()
 
     if threading.current_thread() is threading.main_thread():
         for sig in (signal.SIGINT, signal.SIGTERM):
             try:
                 loop.add_signal_handler(sig, signal_handler)
             except NotImplementedError:
-                 print(f"ℹ️ 信号 {sig} 处理在当前系统可能不受支持。请使用 Ctrl+C。")
-
+                print(f"ℹ️ 信号 {sig} 处理在当前系统可能不受支持。请使用 Ctrl+C。")
 
     try:
         print("🚀 UniPaste Mac 节点已启动")
-        print(f"📂 临时文件目录: {listener.temp_dir}")
+        print(f"📂 临时文件目录: {listener.file_handler.temp_dir}")
         print("📋 按 Ctrl+C 退出程序")
 
         listener.server_task = asyncio.create_task(listener.start_server())
@@ -1203,15 +643,13 @@ async def run_listener(listener: ClipboardListener):
         await asyncio.gather(listener.server_task, listener.sync_task, listener.clipboard_task)
 
     except asyncio.CancelledError:
-        # Expected on shutdown
         pass
     except Exception as e:
         print(f"\n❌ 发生未处理的错误: {e}")
-        import traceback
         traceback.print_exc()
     finally:
         if listener.running:
-             listener.stop()
+            listener.stop()
         await listener.finalize_shutdown()
         print("🚪 程序退出")
 
@@ -1225,22 +663,38 @@ def run_headless():
     asyncio.run(main())
 
 
+# ------------------------------------------------------------------
+# Tray app
+# ------------------------------------------------------------------
+
 class MacTrayApp(rumps.App):
     def __init__(self, host, open_panel_callback):
-        # Use the template icon for macOS status bar
         icon_path = _resource_path("assets", "unipaste_mac_template.png")
         if not os.path.exists(icon_path):
-             icon_path = _resource_path("assets", "unipaste.png")
+            icon_path = _resource_path("assets", "unipaste.png")
         if not os.path.exists(icon_path):
-             icon_path = None
+            icon_path = None
         super(MacTrayApp, self).__init__("UniPaste", icon=icon_path, quit_button=None)
         self.host = host
         self.open_panel_callback = open_panel_callback
+        self._status_item = rumps.MenuItem("○ 等待连接")
         self.menu = [
+            self._status_item,
+            None,
             rumps.MenuItem("打开控制面板", callback=self.on_open_panel),
-            None,  # Separator
+            None,
             rumps.MenuItem("退出 UniPaste", callback=self.on_quit)
         ]
+        self._status_timer = rumps.Timer(self._update_status, 3)
+        self._status_timer.start()
+
+    def _update_status(self, _):
+        try:
+            snapshot = self.host.get_ui_snapshot() or {}
+            n = len(snapshot.get("connected_peers", []))
+            self._status_item.title = f"● 已连接 {n} 台" if n > 0 else "○ 等待连接"
+        except Exception:
+            pass
 
     def on_open_panel(self, _):
         if self.open_panel_callback:
@@ -1251,13 +705,19 @@ class MacTrayApp(rumps.App):
         self.host.stop()
         rumps.quit_application()
 
-    def notify_pairing_request(self):
+    def notify_pairing_request(self, device_name, platform):
         rumps.notification(
             title="UniPaste 配对请求",
-            subtitle="有新设备请求配对",
+            subtitle=f"{device_name} ({platform}) 请求配对",
             message="请打开控制面板确认或拒绝请求"
         )
+        if self.open_panel_callback:
+            self.open_panel_callback()
 
+
+# ------------------------------------------------------------------
+# Control panel and multiprocess support
+# ------------------------------------------------------------------
 
 class SharedHostProxy:
     """A proxy that looks like ServiceHost but works across processes."""
@@ -1278,17 +738,17 @@ class SharedHostProxy:
 
     def install_autostart(self):
         self.cmd_queue.put(("install_autostart", None))
-        return True, "请求已发送"
+        return True, "LaunchAgent request sent"
 
     def remove_autostart(self):
         self.cmd_queue.put(("remove_autostart", None))
-        return True, "请求已发送"
+        return True, "LaunchAgent request sent"
 
     def full_quit(self):
         self.cmd_queue.put(("full_quit", None))
 
     def stop(self):
-        pass # Panel process shouldn't stop the service
+        pass  # Panel process shouldn't stop the service
 
 
 def run_panel_process(shared_dict, cmd_queue):
@@ -1306,7 +766,8 @@ def run_control_panel():
     with Manager() as manager:
         shared_dict = manager.dict()
         cmd_queue = Queue()
-        
+        shared_dict["panel_focus_token"] = time.time()
+
         listener = ClipboardListener()
         autostart_manager = MacLaunchAgentManager(script_path=Path(__file__).resolve())
         host = ServiceHost(
@@ -1320,21 +781,20 @@ def run_control_panel():
         def open_panel():
             p = panel_process_info["process"]
             if p and p.is_alive():
+                shared_dict["panel_focus_token"] = time.time()
                 return
 
+            shared_dict["panel_focus_token"] = time.time()
             p = Process(target=run_panel_process, args=(shared_dict, cmd_queue), daemon=True)
             p.start()
             panel_process_info["process"] = p
 
-        # Background thread to sync state and process commands
         def sync_worker():
             while listener.running:
                 try:
-                    # Update snapshot
                     snapshot = host.get_ui_snapshot()
                     shared_dict.update(snapshot)
-                    
-                    # Process commands from panel
+
                     while not cmd_queue.empty():
                         try:
                             cmd_info = cmd_queue.get_nowait()
@@ -1350,8 +810,8 @@ def run_control_panel():
                             elif cmd == "full_quit":
                                 rumps.quit_application()
                         except Exception as qe:
-                             print(f"⚠️ 处理指令失败: {qe}")
-                    
+                            print(f"⚠️ 处理指令失败: {qe}")
+
                     time.sleep(0.5)
                 except Exception as e:
                     if listener.running:
@@ -1363,8 +823,9 @@ def run_control_panel():
 
         tray = MacTrayApp(host, open_panel)
         listener.ui_attention_callback = tray.notify_pairing_request
-        
+
         host.start()
+        open_panel()
         try:
             tray.run()
         finally:
@@ -1388,15 +849,11 @@ def parse_args():
 if __name__ == '__main__':
     if getattr(sys, 'frozen', False):
         multiprocessing.set_executable(sys.executable)
-    # Fix for multiprocessing with spawn on frozen macOS apps
     if getattr(sys, 'frozen', False) and sys.platform == 'darwin':
         if len(sys.argv) > 1:
             if sys.argv[1] == '-c' and len(sys.argv) > 2:
-                # Handle resource tracker and other -c commands
                 exec(sys.argv[2])
                 sys.exit()
-            # If the command starts with Python flags like -B -S -I -c
-            # (common when multiprocessing spawns a process in a frozen app)
             for i, arg in enumerate(sys.argv):
                 if arg == '-c' and i + 1 < len(sys.argv):
                     exec(sys.argv[i+1])
@@ -1430,4 +887,4 @@ if __name__ == '__main__':
         else:
             run_control_panel()
     except KeyboardInterrupt:
-         print("\n⌨️ 检测到 Ctrl+C，强制退出...")
+        print("\n⌨️ 检测到 Ctrl+C，强制退出...")

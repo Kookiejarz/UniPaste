@@ -11,6 +11,7 @@ class SecurityManager:
         self.private_key = None
         self.public_key = None
         self.shared_key = None
+        self._cipher: AESGCM | None = None  # cached — key schedule computed once
 
     def generate_key_pair(self):
         """Generate new ECDH key pair"""
@@ -60,6 +61,7 @@ class SecurityManager:
             salt=None,
             info=b'handshake data',
         ).derive(shared_key)
+        self._cipher = AESGCM(self.shared_key)
         print(f"🔑 ECDH密钥交换成功，前8字节: {self.shared_key[:8].hex()}")
         return self.shared_key
 
@@ -67,60 +69,33 @@ class SecurityManager:
         """Set shared key from a password (for testing)"""
         import hashlib
         self.shared_key = hashlib.sha256(password.encode()).digest()
+        self._cipher = AESGCM(self.shared_key)
         print(f"🔑 从密码设置密钥，前8字节: {self.shared_key[:8].hex()}")
         return self.shared_key
 
     def encrypt_message(self, message: bytes) -> bytes:
         """Encrypt a message using AES-256-GCM."""
-        if not self.shared_key:
+        if not self._cipher:
             raise ValueError("Shared key not established")
-        
         try:
-            aesgcm = AESGCM(self.shared_key)
             nonce = os.urandom(12)
-            ciphertext = aesgcm.encrypt(nonce, message, None)
-            encrypted = nonce + ciphertext
-            return encrypted
+            return nonce + self._cipher.encrypt(nonce, message, None)
         except Exception as e:
             print(f"❌ 加密失败: {e}")
             raise
 
-    def decrypt_message(self, encrypted_data):
+    def decrypt_message(self, encrypted_data: bytes) -> bytes:
         """Decrypt a message using AES-256-GCM."""
-        if not self.shared_key:
+        if not self._cipher:
             raise ValueError("Shared key not established")
-        
-        # 确保数据是二进制格式
         if not isinstance(encrypted_data, bytes):
-            try:
-                if isinstance(encrypted_data, str):
-                    if encrypted_data.startswith('{'):
-                        raise ValueError("JSON string cannot be decrypted directly")
-                    
-                    encrypted_data = encrypted_data.encode('utf-8')
-                else:
-                    raise TypeError(f"无法处理的数据类型: {type(encrypted_data)}")
-            except Exception as e:
-                print(f"❌ 数据类型转换失败: {e}")
-                raise
-        
+            raise TypeError(f"无法处理的数据类型: {type(encrypted_data)}")
         try:
-            # 检查数据格式
             if len(encrypted_data) <= 12:
                 raise ValueError(f"数据太短: {len(encrypted_data)} 字节")
-                
-            # 提取nonce和密文
-            nonce = encrypted_data[:12]
-            ciphertext = encrypted_data[12:]
-            
-            aesgcm = AESGCM(self.shared_key)
-            decrypted_data = aesgcm.decrypt(nonce, ciphertext, None)
-            
-            return decrypted_data
+            return self._cipher.decrypt(encrypted_data[:12], encrypted_data[12:], None)
         except Exception as e:
-            print(f"❌ 解密失败: {e}")
-            print(f"数据长度: {len(encrypted_data)} 字节")
-            print(f"数据预览 (十六进制): {encrypted_data[:20].hex()}")
+            print(f"❌ 解密失败: {e} (数据长度={len(encrypted_data)}字节)")
             raise
 
     async def perform_key_exchange(self, send_data_func, receive_data_func):

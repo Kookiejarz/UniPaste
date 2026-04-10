@@ -24,7 +24,14 @@ class WindowsTrayApp:
     def stop(self):
         self.icon.stop()
 
-    def notify_pairing_request(self):
+    def notify_pairing_request(self, device_name="未知设备", platform="未知平台"):
+        try:
+            self.icon.notify(
+                f"{device_name} ({platform}) 请求配对",
+                "UniPaste 配对请求"
+            )
+        except Exception:
+            pass
         self.icon.update_menu()
         self._open_panel()
 

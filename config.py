@@ -7,11 +7,12 @@ class ClipboardConfig:
     
     # 文件传输相关
     MAX_FILE_SIZE_AUTO = 1000 * 1024 * 1024  # 1000MB自动传输限制
-    CHUNK_SIZE = 700 * 1024  # 1MB分块大小
-    
+    CHUNK_SIZE = 2 * 1024 * 1024  # 2MB分块大小
+    CHUNK_YIELD_INTERVAL = 8  # yield to event loop every N chunks
+
     # 时间间隔配置
     MIN_PROCESS_INTERVAL = 0.8  # 最小处理间隔
-    NETWORK_DELAY = 0.05  # 网络传输延迟
+    NETWORK_DELAY = 0.0  # 网络传输延迟
     CLIPBOARD_CHECK_INTERVAL = 0.3  # 剪贴板检查间隔
     
     # 显示相关

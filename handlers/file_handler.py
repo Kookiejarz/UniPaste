@@ -327,7 +327,9 @@ class FileHandler:
                     if not chunk_data:
                         break
 
-                    chunk_message = {
+                    # Binary-framed chunk: BCHK + 4-byte header-len + JSON header + raw bytes
+                    # Avoids base64 encoding (saves ~33% bandwidth + CPU)
+                    chunk_header = {
                         "type": MessageType.FILE_CHUNK,
                         "filename": path_obj.name,
                         "transfer_id": transfer_id,
@@ -338,17 +340,20 @@ class FileHandler:
                         "file_hash": file_hash,
                         "content_fingerprint": content_fingerprint,
                         "chunk_hash": hashlib.md5(chunk_data).hexdigest(),
-                        "chunk_data": base64.b64encode(chunk_data).decode("utf-8"),
                         "origin_device_id": origin_device_id,
                         "event_id": event_id,
                         **item_metadata,
                     }
+                    header_bytes = json.dumps(chunk_header).encode("utf-8")
+                    payload = b'BCHK' + len(header_bytes).to_bytes(4, "big") + header_bytes + chunk_data
 
                     progress = self._format_progress(chunk_index + 1, total_chunks)
                     print(f"\r📤 传输文件 {path_obj.name}: {progress}", end="", flush=True)
 
-                    await send_encrypted_fn(json.dumps(chunk_message).encode("utf-8"))
-                    await asyncio.sleep(ClipboardConfig.NETWORK_DELAY)
+                    await send_encrypted_fn(payload)
+                    # Yield to event loop periodically to avoid starving other coroutines
+                    if (chunk_index - start_chunk + 1) % ClipboardConfig.CHUNK_YIELD_INTERVAL == 0:
+                        await asyncio.sleep(0)
 
             print(f"\n✅ 文件 {path_obj.name} 传输完成")
             return True
@@ -406,11 +411,15 @@ class FileHandler:
                 )
                 self.pending_transfers[transfer_id] = transfer
 
-            try:
-                chunk_data = base64.b64decode(message.get("chunk_data", ""))
-            except Exception as decode_error:
-                print(f"❌ 文件块 Base64 解码失败: {decode_error}")
-                return False, None
+            # Support both binary-framed (preferred) and legacy base64 formats
+            if "_binary_data" in message:
+                chunk_data = message["_binary_data"]
+            else:
+                try:
+                    chunk_data = base64.b64decode(message.get("chunk_data", ""))
+                except Exception as decode_error:
+                    print(f"❌ 文件块 Base64 解码失败: {decode_error}")
+                    return False, None
 
             if not chunk_data and transfer["total_chunks"] > 0:
                 print("⚠️ 收到的文件块数据为空")

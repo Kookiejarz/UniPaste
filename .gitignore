@@ -35,3 +35,5 @@ dist/
 
 # Development tools
 generate_icons.py
+
+.claude/*
