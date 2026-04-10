@@ -54,6 +54,8 @@ class FileHandler:
         self.load_file_cache()
         self.chunk_size = ClipboardConfig.CHUNK_SIZE
         self.pending_transfers = {}
+        self.active_outbound = {}  # transfer_id -> {filename, file_size, sent_chunks, total_chunks}
+        self.on_transfer_complete = None  # callback(filename, peer_id, direction)
 
     def _init_temp_dir(self):
         """初始化临时目录"""
@@ -320,42 +322,54 @@ class FileHandler:
                 f"({file_size/1024/1024:.1f}MB, 从第 {start_chunk + 1} 块开始，共 {total_chunks} 块)"
             )
 
-            with open(path_obj, "rb") as f:
-                f.seek(start_offset)
-                for chunk_index in range(start_chunk, total_chunks):
-                    chunk_data = f.read(self.chunk_size)
-                    if not chunk_data:
-                        break
+            self.active_outbound[transfer_id] = {
+                "filename": path_obj.name,
+                "file_size": file_size,
+                "sent_chunks": start_chunk,
+                "total_chunks": total_chunks,
+            }
+            try:
+                with open(path_obj, "rb") as f:
+                    f.seek(start_offset)
+                    for chunk_index in range(start_chunk, total_chunks):
+                        chunk_data = f.read(self.chunk_size)
+                        if not chunk_data:
+                            break
 
-                    # Binary-framed chunk: BCHK + 4-byte header-len + JSON header + raw bytes
-                    # Avoids base64 encoding (saves ~33% bandwidth + CPU)
-                    chunk_header = {
-                        "type": MessageType.FILE_CHUNK,
-                        "filename": path_obj.name,
-                        "transfer_id": transfer_id,
-                        "chunk_index": chunk_index,
-                        "total_chunks": total_chunks,
-                        "chunk_size": self.chunk_size,
-                        "size": file_size,
-                        "file_hash": file_hash,
-                        "content_fingerprint": content_fingerprint,
-                        "chunk_hash": hashlib.md5(chunk_data).hexdigest(),
-                        "origin_device_id": origin_device_id,
-                        "event_id": event_id,
-                        **item_metadata,
-                    }
-                    header_bytes = json.dumps(chunk_header).encode("utf-8")
-                    payload = b'BCHK' + len(header_bytes).to_bytes(4, "big") + header_bytes + chunk_data
+                        # Binary-framed chunk: BCHK + 4-byte header-len + JSON header + raw bytes
+                        # Avoids base64 encoding (saves ~33% bandwidth + CPU)
+                        chunk_header = {
+                            "type": MessageType.FILE_CHUNK,
+                            "filename": path_obj.name,
+                            "transfer_id": transfer_id,
+                            "chunk_index": chunk_index,
+                            "total_chunks": total_chunks,
+                            "chunk_size": self.chunk_size,
+                            "size": file_size,
+                            "file_hash": file_hash,
+                            "content_fingerprint": content_fingerprint,
+                            "chunk_hash": hashlib.md5(chunk_data).hexdigest(),
+                            "origin_device_id": origin_device_id,
+                            "event_id": event_id,
+                            **item_metadata,
+                        }
+                        header_bytes = json.dumps(chunk_header).encode("utf-8")
+                        payload = b'BCHK' + len(header_bytes).to_bytes(4, "big") + header_bytes + chunk_data
 
-                    progress = self._format_progress(chunk_index + 1, total_chunks)
-                    print(f"\r📤 传输文件 {path_obj.name}: {progress}", end="", flush=True)
+                        self.active_outbound[transfer_id]["sent_chunks"] = chunk_index + 1
+                        progress = self._format_progress(chunk_index + 1, total_chunks)
+                        print(f"\r📤 传输文件 {path_obj.name}: {progress}", end="", flush=True)
 
-                    await send_encrypted_fn(payload)
-                    # Yield to event loop periodically to avoid starving other coroutines
-                    if (chunk_index - start_chunk + 1) % ClipboardConfig.CHUNK_YIELD_INTERVAL == 0:
-                        await asyncio.sleep(0)
+                        await send_encrypted_fn(payload)
+                        # Yield to event loop periodically to avoid starving other coroutines
+                        if (chunk_index - start_chunk + 1) % ClipboardConfig.CHUNK_YIELD_INTERVAL == 0:
+                            await asyncio.sleep(0)
+            finally:
+                self.active_outbound.pop(transfer_id, None)
 
             print(f"\n✅ 文件 {path_obj.name} 传输完成")
+            if callable(self.on_transfer_complete):
+                self.on_transfer_complete(path_obj.name, origin_device_id, "send")
             return True
 
         except Exception as e:
@@ -373,6 +387,40 @@ class FileHandler:
         filled = min(bar_length, (percentage * bar_length) // 100)
         bar = "█" * filled + "░" * (bar_length - filled)
         return f"[{bar}] {percentage}% ({current}/{total})"
+
+    def get_active_transfers(self) -> list:
+        """返回当前所有活跃传输的状态，供 UI snapshot 使用。"""
+        result = []
+        for tid, t in list(self.pending_transfers.items()):
+            total = t.get("total_chunks", 0)
+            done = t.get("next_chunk", 0)
+            pct = int(done * 100 / total) if total > 0 else 0
+            file_size = t.get("file_size", 0)
+            result.append({
+                "transfer_id": tid,
+                "filename": t.get("filename", ""),
+                "file_size": file_size,
+                "received_bytes": t.get("received_bytes", 0),
+                "percent": pct,
+                "direction": "receive",
+                "peer_id": t.get("origin_device_id"),
+            })
+        for tid, t in list(self.active_outbound.items()):
+            total = t.get("total_chunks", 0)
+            done = t.get("sent_chunks", 0)
+            pct = int(done * 100 / total) if total > 0 else 0
+            file_size = t.get("file_size", 0)
+            sent_bytes = int(done * file_size / total) if total > 0 else 0
+            result.append({
+                "transfer_id": tid,
+                "filename": t.get("filename", ""),
+                "file_size": file_size,
+                "received_bytes": sent_bytes,
+                "percent": pct,
+                "direction": "send",
+                "peer_id": None,
+            })
+        return result
 
     async def handle_received_chunk(self, message: dict, send_encrypted_fn=None) -> tuple[bool, Path | None]:
         """
@@ -501,6 +549,8 @@ class FileHandler:
                 self.add_to_file_cache(content_fingerprint, str(final_path))
             self._discard_transfer_state(transfer_id, remove_partial=False)
             print(f"✅ 文件 {filename} 哈希校验成功")
+            if callable(self.on_transfer_complete):
+                self.on_transfer_complete(filename, transfer.get("origin_device_id"), "receive")
             return True, final_path
 
         except Exception as e:

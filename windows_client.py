@@ -342,6 +342,7 @@ def run_tray_app():
 
     tray = WindowsTrayApp(host, open_panel)
     client.ui_attention_callback = lambda name, platform: tray.notify_pairing_request(name, platform)
+    client.ui_transfer_notify_callback = tray.notify_transfer_complete
     host.start()
     open_panel()
     try:

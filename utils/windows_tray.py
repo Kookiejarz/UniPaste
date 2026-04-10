@@ -35,6 +35,18 @@ class WindowsTrayApp:
         self.icon.update_menu()
         self._open_panel()
 
+    def notify_transfer_complete(self, filename: str, peer_id: str | None, direction: str):
+        if direction == "receive":
+            msg = f"已接收: {filename}"
+            if peer_id:
+                msg += f"  ←  {peer_id}"
+        else:
+            msg = f"已发送: {filename}"
+        try:
+            self.icon.notify(msg, "UniPaste · 文件传输完成")
+        except Exception:
+            pass
+
     def _open_panel(self, *_args):
         self.open_panel_callback()
 

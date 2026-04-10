@@ -86,6 +86,8 @@ class ClipboardNode(ABC):
         self.running = True
         self.discovery_event = asyncio.Event()
         self.ui_attention_callback = None
+        self.ui_transfer_notify_callback = None
+        self.file_handler.on_transfer_complete = self._on_file_transfer_complete
 
     # ------------------------------------------------------------------
     # Identity
@@ -287,6 +289,10 @@ class ClipboardNode(ABC):
             self.ui_attention_callback(request.device_name, request.platform)
             return
 
+    def _on_file_transfer_complete(self, filename: str, peer_id: str | None, direction: str):
+        if callable(self.ui_transfer_notify_callback):
+            self.ui_transfer_notify_callback(filename, peer_id, direction)
+
         if sys.stdin and sys.stdin.isatty():
             print("是否允许此设备连接? (输入 'y' 接受, 'n' 拒绝)")
 
@@ -365,6 +371,7 @@ class ClipboardNode(ABC):
             "connected_peers": connected_peers,
             "discovered_peers": discovered_peers,
             "pending_pairings": pending_pairings,
+            "active_transfers": self.file_handler.get_active_transfers(),
             "last_error": self.last_ui_error,
             "thread_alive": True,  # ServiceHost will override this
         }

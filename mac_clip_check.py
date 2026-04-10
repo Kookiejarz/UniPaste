@@ -714,6 +714,19 @@ class MacTrayApp(rumps.App):
         if self.open_panel_callback:
             self.open_panel_callback()
 
+    def notify_transfer_complete(self, filename: str, peer_id: str | None, direction: str):
+        if direction == "receive":
+            subtitle = f"已接收: {filename}"
+            message = f"来自 {peer_id}" if peer_id else ""
+        else:
+            subtitle = f"已发送: {filename}"
+            message = ""
+        rumps.notification(
+            title="UniPaste · 文件传输完成",
+            subtitle=subtitle,
+            message=message,
+        )
+
 
 # ------------------------------------------------------------------
 # Control panel and multiprocess support
@@ -823,6 +836,7 @@ def run_control_panel():
 
         tray = MacTrayApp(host, open_panel)
         listener.ui_attention_callback = tray.notify_pairing_request
+        listener.ui_transfer_notify_callback = tray.notify_transfer_complete
 
         host.start()
         open_panel()
