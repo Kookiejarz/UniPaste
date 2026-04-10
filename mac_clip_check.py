@@ -290,6 +290,7 @@ class ClipboardListener(ClipboardNode):
                     ClipboardConfig.HOST,
                     port,
                     subprotocols=["binary"],
+                    max_size=ClipboardConfig.WEBSOCKET_MAX_SIZE,
                     ping_interval=ClipboardConfig.PING_INTERVAL,
                     ping_timeout=ClipboardConfig.PING_TIMEOUT
                 )
@@ -491,6 +492,8 @@ def run_headless():
 # Tray app
 # ------------------------------------------------------------------
 
+
+
 class MacTrayApp(rumps.App):
     def __init__(self, host, open_panel_callback):
         icon_path = _resource_path("assets", "unipaste_mac_template.png")
@@ -511,7 +514,7 @@ class MacTrayApp(rumps.App):
         ]
         self._status_timer = rumps.Timer(self._update_status, 3)
         self._status_timer.start()
-        self._notification_queue = queue.Queue()
+        self._notification_queue = queue.SimpleQueue()
         self._notif_timer = rumps.Timer(self._flush_notifications, 0.5)
         self._notif_timer.start()
 
@@ -533,11 +536,11 @@ class MacTrayApp(rumps.App):
         rumps.quit_application()
 
     def notify_pairing_request(self, device_name, platform):
-        rumps.notification(
-            title="UniPaste 配对请求",
-            subtitle=f"{device_name} ({platform}) 请求配对",
-            message="请打开控制面板确认或拒绝请求"
-        )
+        self._notification_queue.put((
+            "UniPaste 配对请求",
+            f"{device_name} ({platform}) 请求配对",
+            "请打开控制面板确认或拒绝请求",
+        ))
         if self.open_panel_callback:
             self.open_panel_callback()
 
@@ -548,12 +551,13 @@ class MacTrayApp(rumps.App):
         else:
             subtitle = f"已发送: {filename}"
             message = ""
-        self._notification_queue.put(("UniPaste · 文件传输完成", subtitle, message))
+        self._notification_queue.put(("UniPaste 文件传输完成", subtitle, message))
 
     def _flush_notifications(self, _):
+        """Called on the main thread every 0.5 s by rumps.Timer."""
         while not self._notification_queue.empty():
             try:
-                title, subtitle, message = self._notification_queue.get_nowait()
+                title, subtitle, message = self._notification_queue.get()
                 rumps.notification(title=title, subtitle=subtitle, message=message)
             except Exception:
                 break

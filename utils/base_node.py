@@ -676,6 +676,7 @@ class ClipboardNode(ABC):
                     ClipboardConfig.HOST,
                     port,
                     subprotocols=["binary"],
+                    max_size=ClipboardConfig.WEBSOCKET_MAX_SIZE,
                     ping_interval=ClipboardConfig.PING_INTERVAL,
                     ping_timeout=ClipboardConfig.PING_TIMEOUT
                 )
