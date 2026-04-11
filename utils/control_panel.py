@@ -303,17 +303,6 @@ class ControlPanel:
                 pass
             return
 
-        try:
-            self.root.attributes("-topmost", True)
-            self.root.after(120, lambda: self.root and self.root.attributes("-topmost", False))
-        except Exception:
-            pass
-
-        try:
-            self.root.focus_force()
-        except Exception:
-            pass
-
     def _refresh(self):
         if not self.root:
             return
